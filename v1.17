@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name SCC Customizing Search
 // @namespace http://tampermonkey.net/
-// @version 1.17
+// @version 1.18
 // @description Track specific package states with customizable search
 // @author forleof & Cedric
 // @match https://logistics.amazon.co.uk/station/dashboard/*
@@ -3419,14 +3419,27 @@ function setupActionButtonHandlers(container) {
         visibleRows.forEach(row => {
             const cells = Array.from(row.querySelectorAll('td')).slice(1); // Salta colonna indicatori visuale
 
-            // Dati base (tutte le colonne inclusa Days OOR)
-            const baseData = cells.map(cell => {
-                let text = cell.textContent.trim();
-                if (text.includes(',') || text.includes('"')) {
-                    text = `"${text.replace(/"/g, '""')}"`;
-                }
-                return text;
-            });
+           // Dati base (tutte le colonne inclusa Days OOR) - CON PULIZIA AVANZATA
+const baseData = cells.map((cell, index) => {
+    let text = cell.textContent.trim();
+
+    // ✅ PULIZIA SPECIALE PER TRACKING ID (prima colonna dopo indicatori)
+    if (index === 0) { // Colonna Tracking ID
+        // Rimuovi tutti gli spazi, caratteri invisibili e mantieni solo alfanumerici
+        text = text.replace(/\s+/g, '').replace(/[^\w]/g, '').toUpperCase();
+        debugLog(`[EXPORT CLEAN] Tracking ID cleaned: "${cell.textContent.trim()}" -> "${text}"`);
+    }
+
+    // ✅ PULIZIA GENERALE per tutte le altre colonne
+    text = text.replace(/\s+/g, ' ').trim(); // Normalizza spazi multipli in singoli
+
+    // ✅ ESCAPE CSV se necessario
+    if (text.includes(',') || text.includes('"') || text.includes('\n')) {
+        text = `"${text.replace(/"/g, '""')}"`;
+    }
+
+    return text;
+});
 
             // ✅ DATI INDICATORI
             const rowIndicators = [];
