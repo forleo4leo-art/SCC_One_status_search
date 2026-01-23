@@ -1,0 +1,4378 @@
+// ==UserScript==
+// @name SCC Customizing Search DEV
+// @namespace http://tampermonkey.net/
+// @version 1.22
+// @description Track specific package states with customizable search
+// @author forleof & Cedric & Atlas
+// @match https://*/station/dashboard/*
+// @require http://code.jquery.com/jquery-3.4.1.min.js
+// @grant GM_xmlhttpRequest
+// @grant GM.xmlHttpRequest
+// @grant GM_addStyle
+// @updateURL https://axzile.corp.amazon.com/-/carthamus/download_script/scc-customizing-search-dev.user.js
+// @downloadURL https://axzile.corp.amazon.com/-/carthamus/download_script/scc-customizing-search-dev.user.js
+// @run-at document-end
+// @run-at document-idle
+// ==/UserScript==
+
+// ✅ REGISTRAZIONE IMMEDIATA - PRIMA DI TUTTO
+try {
+    // Crea il registry se non esiste
+    if (typeof window.toolbarRegistry === 'undefined') {
+        window.toolbarRegistry = {
+            scripts: new Map(),
+            masterActive: false
+        };
+        console.log('[SCC] Created new toolbar registry');
+    }
+
+    // Registra sempre lo script IMMEDIATAMENTE
+    window.toolbarRegistry.scripts.set('scc-customizing-search', {
+        id: 'scc-customizing-search',
+        name: 'SCC Search',
+        icon: '🔍',
+        version: '1.17',
+        callback: function() {
+            const container = document.getElementById('sccSearchContainer');
+            if (container) {
+                container.style.display = container.style.display === 'none' ? 'block' : 'none';
+                const exportButton = document.getElementById('exportButton');
+                if (exportButton) exportButton.style.display = 'none';
+            }
+        },
+        buttonElement: null
+    });
+
+    console.log(`[SCC] Script registered successfully. Registry size: ${window.toolbarRegistry.scripts.size}`);
+
+} catch(error) {
+    console.error('[SCC] Registration failed:', error);
+}
+
+// ✅ RESTO DELLO SCRIPT
+(function() {
+    'use strict';
+
+
+// ================================================================================================
+// SEZIONE 1: CONFIGURAZIONE E COSTANTI
+// ================================================================================================
+
+console.log('[SCC] INIZIO SEZIONE 1: Configurazione e costanti');
+
+const SCRIPT_VERSION = GM_info.script.version;
+
+// ✅ GENERAZIONE DINAMICA URLs basata su @updateURL e @downloadURL
+function generateUpdateUrls() {
+    // Prende gli URL dagli header del GM_info
+    const updateUrl = GM_info.script.updateURL;
+    const downloadUrl = GM_info.script.downloadURL;
+
+    if (updateUrl && downloadUrl) {
+        console.log(`[SCC] 🔄 Using URLs from headers:`);
+        console.log(`[SCC] 📋 Update: ${updateUrl}`);
+        console.log(`[SCC] 📥 Download: ${downloadUrl}`);
+        return { updateUrl, downloadUrl };
+    }
+
+    // Fallback se non trova gli URL (non dovrebbe mai succedere)
+    const fallbackUpdate = 'https://axzile.corp.amazon.com/-/carthamus/download_script/scc-customizing-search.user.js';
+    const fallbackDownload = 'https://axzile.corp.amazon.com/-/carthamus/download_script/scc-customizing-search.user.js';
+    console.log(`[SCC] ⚠️ URLs not found in headers, using fallback`);
+    return { updateUrl: fallbackUpdate, downloadUrl: fallbackDownload };
+}
+
+// ✅ Auto-update configuration (DOPO la funzione)
+const SCRIPT_URLS = generateUpdateUrls();
+const UPDATE_CONFIG = {
+    CHECK_INTERVAL: 24 * 60 * 60 * 1000, // 24 ore in millisecondi
+    UPDATE_URL: SCRIPT_URLS.updateUrl, // ✅ Per controllo versioni
+    DOWNLOAD_URL: SCRIPT_URLS.downloadUrl, // ✅ Per download effettivo
+    NOTIFICATION_DURATION: 10000, // 10 secondi
+    STORAGE_KEY: 'scc_last_update_check'
+};
+
+// State-Operation pairs definition with aliases (sorted by alias)
+const STATE_OPERATION_PAIRS = [
+    { state: '', operation: '', alias: 'Hold CTRL to select multiple states' },
+    { state: 'ARRIVED', operation: 'PACKAGE_STATE_UPDATE', alias: 'Arrived' },
+    { state: 'DELIVERY_FAILED', operation: 'PACKAGE_STATE_UPDATE', alias: 'Delivery Failed' },
+    { state: 'DELIVERY_FAILED', operation: 'PACKAGE_STATE_UPDATE', reasonCode: 'object_missing', alias: 'Delivery Failed - Object Missing' }, // ✅ NUOVO
+    { state: 'DELIVERED', operation: 'PACKAGE_STATE_UPDATE', alias: 'Delivered' },
+    { state: 'HELD', operation: 'PACKAGE_STATE_UPDATE', alias: 'Held' },
+    { state: 'INDUCTED', operation: 'PACKAGE_STATE_UPDATE', alias: 'Inducted' },
+    { state: 'IN_TRANSIT', operation: 'PACKAGE_STATE_UPDATE', destination: 'CUSTOMER_ADDRESS', alias: 'In Transit - To Customer' },
+    { state: 'IN_TRANSIT', operation: 'PACKAGE_STATE_UPDATE', alias: 'In Transit - To DS' },
+    { state: 'MANIFESTED', operation: 'PACKAGE_INJECTION', alias: 'Manifested' },
+    { state: 'MARKED_AS_LOST', operation: 'PACKAGE_STATE_UPDATE', alias: 'Marked As Lost' },
+    { state: 'MARKED_AS_MISSING', operation: 'PACKAGE_STATE_UPDATE', alias: 'Marked As Missing' },
+    { state: 'MARKED_FOR_REPROCESS', operation: 'PACKAGE_STATE_UPDATE', alias: 'Marked For Reprocess' },
+    { state: 'MARKED_FOR_PROBLEM', operation: 'PACKAGE_STATE_UPDATE', alias: 'Marked For Problem' },
+    { state: 'MARKED_FOR_PROBLEM', operation: 'PACKAGE_STATE_UPDATE', reasonCode: 'empty package', alias: 'Marked For Problem - Empty Package' },
+    { state: 'PICKED', operation: 'PACKAGE_STATE_UPDATE', alias: 'Picked' },
+    { state: 'RECEIVED', operation: 'ASSOCIATE_DEBRIEF', alias: 'Received - Associate Debrief' },
+    { state: 'RECEIVED', operation: 'SELF_DEBRIEF', reasonCode: 'self_service_return', alias: 'Received - Self Service Return' },
+    { state: 'RECEIVED', operation: 'INBOUND_RECEIVE', alias: 'Received - Inbound Receive' },
+    { state: 'STAGED', operation: 'PACKAGE_STATE_UPDATE', alias: 'Staged' },
+    { state: 'STOWED', operation: 'PACKAGE_STATE_UPDATE', alias: 'Stowed' }
+];
+
+// Global state to track initialization
+const scriptState = {
+    initialized: false,
+    attempts: 0,
+    maxAttempts: 5
+};
+
+// ✅ SISTEMA OTTIMIZZATO CON RECOVERY INTELLIGENTE
+// Cambia solo questo numero per modificare l'aggressività:
+const PERFORMANCE_LEVEL = 3;  // ✅ RACCOMANDATO: 3 (sweet spot dalle tue osservazioni)
+
+// ✅ CONFIGURAZIONI OTTIMIZZATE CON RECOVERY
+const PERFORMANCE_CONFIGS = {
+    1: { // Ultra Conservativo
+        BATCH_SIZE: 1,
+        BATCH_DELAY: 750,
+        USE_JITTER: true,
+        JITTER_MIN: 500,
+        JITTER_MAX: 1500,
+        USE_ADAPTIVE: false,
+        DESCRIPTION: "Ultra Safe - 1 sequential request (slowest, safest)"
+    },
+    2: { // Conservativo
+        BATCH_SIZE: 2,
+        BATCH_DELAY: 800,
+        USE_JITTER: true,
+        JITTER_MIN: 300,
+        JITTER_MAX: 800,
+        USE_ADAPTIVE: false,
+        DESCRIPTION: "Conservative - 2 parallel requests (safe, medium speed)"
+    },
+    3: { // Sweet Spot - RACCOMANDATO
+        BATCH_SIZE: 3,
+        BATCH_DELAY: 400,
+        USE_JITTER: true,
+        JITTER_MIN: 100,
+        JITTER_MAX: 400,
+        USE_ADAPTIVE: false,
+        DESCRIPTION: "Optimal - 3 parallel requests (best speed/safety ratio) ⭐ RECOMMENDED"
+    },
+    4: { // Aggressivo con adaptive leggero
+        BATCH_SIZE: 3,
+        BATCH_DELAY: 200,
+        USE_JITTER: true,
+        JITTER_MIN: 50,
+        JITTER_MAX: 200,
+        USE_ADAPTIVE: true,
+        DESCRIPTION: "Aggressive - 3 parallel with adaptive backoff"
+    },
+    5: { // Turbo - PIÙ INTELLIGENTE
+        BATCH_SIZE: 4,
+        BATCH_DELAY: 300,
+        USE_JITTER: true,
+        JITTER_MIN: 100,
+        JITTER_MAX: 300,
+        USE_ADAPTIVE: true,
+        DESCRIPTION: "Turbo - 4+ parallel with smart recovery system"
+    }
+};
+
+// ✅ APPLICA CONFIGURAZIONE SELEZIONATA
+const PERF_CONFIG = PERFORMANCE_CONFIGS[PERFORMANCE_LEVEL] || PERFORMANCE_CONFIGS[3];
+
+const CONFIG = {
+    // Parametri fissi
+    RETRY_DELAY: 1000,
+    MAX_RETRIES: 5,
+    REQUEST_TIMEOUT: 25000,
+    DEBOUNCE_DELAY: 200,
+
+    // ✅ Parametri dinamici basati su PERFORMANCE_LEVEL
+    BATCH_SIZE: PERF_CONFIG.BATCH_SIZE,
+    BATCH_DELAY: PERF_CONFIG.BATCH_DELAY,
+    USE_JITTER: PERF_CONFIG.USE_JITTER,
+    JITTER_MIN: PERF_CONFIG.JITTER_MIN,
+    JITTER_MAX: PERF_CONFIG.JITTER_MAX,
+    USE_ADAPTIVE: PERF_CONFIG.USE_ADAPTIVE,
+
+    // ✅ PARAMETRI ADAPTIVE MIGLIORATI
+    ADAPTIVE_THRESHOLD: 2500,     // ✅ Soglia più alta: 2.5s invece di 2s
+    ADAPTIVE_BACKOFF_MULTIPLIER: 1.3,  // ✅ Backoff più leggero: 1.3x invece di 1.5x
+    ADAPTIVE_MAX_DELAY: 2500,     // ✅ Delay massimo ridotto
+
+    // ✅ NUOVI PARAMETRI PER RECOVERY INTELLIGENTE
+    RECOVERY_CHECK_INTERVAL: 10,  // Ogni 10 batch, prova a recuperare
+    RECOVERY_THRESHOLD: 1500,     // Se tempi < 1.5s, prova ad aumentare batch
+    MIN_BATCH_SIZE: 2,            // ✅ Non scendere mai sotto 2 (invece di 1)
+    RECOVERY_SUCCESS_COUNT: 3,    // Servono 3 batch veloci consecutivi per aumentare
+
+    // Info per logging
+    PERFORMANCE_LEVEL: PERFORMANCE_LEVEL,
+    PERFORMANCE_DESCRIPTION: PERF_CONFIG.DESCRIPTION
+};
+
+// ✅ MAPPING ALIAS PER OPERATION VALUES
+const OPERATION_ALIASES = {
+    'PACKAGE_STATE_UPDATE': 'Package Scan',
+    'INBOUND_RECEIVE': 'Inbound Receive',
+    'PACKAGE_INJECTION': 'Package Injection',
+    'ASSOCIATE_DEBRIEF': 'Associate Debrief',
+    'SELF_DEBRIEF': 'Self Service Return',
+    'MARKED_FOR_PROBLEM': 'Marked for problem'
+
+    // ✅ Aggiungi altri mapping se necessari
+};
+
+// ✅ FUNZIONE PER CONVERTIRE OPERATIONS IN ALIAS
+function getOperationAlias(operation) {
+    if (!operation) return '';
+
+    if (Array.isArray(operation)) {
+        // Se è un array, converti ogni elemento
+        return operation.map(op => OPERATION_ALIASES[op] || op).join(', ');
+    } else {
+        // Se è una stringa singola
+        return OPERATION_ALIASES[operation] || operation;
+    }
+}
+
+// ✅ LOG CONFIGURAZIONE ATTIVA
+console.log(`[SCC] 🎯 Performance Level: ${PERFORMANCE_LEVEL} - ${CONFIG.PERFORMANCE_DESCRIPTION}`);
+console.log(`[SCC] 📊 Config: Batch=${CONFIG.BATCH_SIZE}, Delay=${CONFIG.BATCH_DELAY}ms, Adaptive=${CONFIG.USE_ADAPTIVE}`);
+console.log('[SCC] ✅ Operation aliases loaded:', Object.keys(OPERATION_ALIASES).length, 'mappings');
+if (CONFIG.USE_ADAPTIVE) {
+    console.log(`[SCC] 🧠 Adaptive: Threshold=${CONFIG.ADAPTIVE_THRESHOLD}ms, Recovery every ${CONFIG.RECOVERY_CHECK_INTERVAL} batches, Min batch=${CONFIG.MIN_BATCH_SIZE}`);
+}
+
+console.log('[SCC] FINE SEZIONE 1: Configurazione e costanti');
+
+
+// ================================================================================================
+// SEZIONE 2: UTILITIES E FUNZIONI DI SUPPORTO
+// ================================================================================================
+
+console.log('[SCC] INIZIO SEZIONE 2: Utilities e funzioni di supporto');
+
+// Debug logging function
+function debugLog(message) {
+    console.log(`[SCC One Status Search] ${message}`); // ✅ CORRETTO
+}
+
+// Debounce utility
+function debounce(func, wait) {
+    let timeout;
+    return function executedFunction(...args) {
+        const later = () => {
+            clearTimeout(timeout);
+            func(...args);
+        };
+        clearTimeout(timeout);
+        timeout = setTimeout(later, wait);
+    };
+}
+
+// Date formatting utility
+function formatDate(timestamp) {
+    if (!timestamp) return '';
+    return new Date(timestamp).toLocaleString('en-GB');
+}
+
+// Extract tracking numbers from input - ULTRA PERMISSIVA
+function extractTrackingNumbers(input) {
+    if (!input) return [];
+
+    // Regex MOLTO permissiva: trova QUALSIASI combinazione di lettere/numeri di 12-13 caratteri
+    const regex = /[A-Z0-9]{12,13}|[A-Z]{2,3}[0-9]{10}|[0-9]{1,3}[A-Z]{2}[0-9]{10}/gi;
+
+    debugLog(`[EXTRACT] Input: "${input}"`);
+
+    // Prima estrazione: prendi tutto quello che potrebbe essere un tracking
+    let possibleMatches = input.match(regex) || [];
+
+    // Seconda estrazione: cerca anche pattern separati da spazi/caratteri
+    const words = input.split(/\s+/);
+    words.forEach(word => {
+        const cleanWord = word.replace(/[^A-Z0-9]/gi, '').toUpperCase();
+        if (cleanWord.length >= 12 && cleanWord.length <= 13) {
+            possibleMatches.push(cleanWord);
+        }
+    });
+
+    debugLog(`[EXTRACT] Possible matches: ${JSON.stringify(possibleMatches)}`);
+
+    const validTrackings = possibleMatches
+        .map(match => match.toUpperCase().replace(/[^A-Z0-9]/g, ''))
+        .filter(trackingId => {
+            // Molto permissivo: solo lunghezza e che abbia almeno qualche numero
+            const hasNumbers = /\d/.test(trackingId);
+            const validLength = trackingId.length >= 12 && trackingId.length <= 13;
+            const isValid = hasNumbers && validLength;
+
+            debugLog(`[EXTRACT] "${trackingId}": length=${trackingId.length}, hasNumbers=${hasNumbers}, valid=${isValid}`);
+
+            return isValid;
+        })
+        .filter((trackingId, index, self) => self.indexOf(trackingId) === index);
+
+    debugLog(`[EXTRACT] Final valid trackings: ${JSON.stringify(validTrackings)}`);
+
+    return validTrackings;
+}
+
+// Wait for element utility
+function waitForElement(selector) {
+    return new Promise(resolve => {
+        const element = document.querySelector(selector);
+        if (element) {
+            resolve(element);
+            return;
+        }
+
+        const observer = new MutationObserver(() => {
+            const element = document.querySelector(selector);
+            if (element) {
+                observer.disconnect();
+                resolve(element);
+            }
+        });
+
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+    });
+}
+
+// Toggle Button State Management - ✅ DIMENSIONI FISSE + SOLO BARRA
+function setToggleButtonState(state, progress = 0) {
+    const toggleButton = document.getElementById('sccSearchToggle');
+    if (!toggleButton) return;
+
+    // Remove all state classes
+    toggleButton.classList.remove('searching', 'completed');
+
+    switch(state) {
+        case 'idle':
+            toggleButton.innerHTML = 'SCC One Status Search';
+            toggleButton.style.backgroundColor = 'rgb(7, 115, 152)';
+            toggleButton.style.boxShadow = '0 2px 5px rgba(0,0,0,0.2)';
+            toggleButton.style.animation = 'none';
+            toggleButton.style.fontSize = '14px';
+            toggleButton.style.lineHeight = 'normal';
+            toggleButton.style.padding = '8px 16px';
+            toggleButton.style.height = 'auto'; // ✅ Reset altezza
+            debugLog('Toggle button set to IDLE state');
+            break;
+
+        case 'searching':
+            toggleButton.classList.add('searching');
+            // ✅ LAYOUT ULTRA-COMPATTO - SOLO BARRA SOTTO IL TESTO
+            toggleButton.innerHTML = `
+                <div style="position: relative; display: inline-block;">
+                    <span style="font-size: 14px; font-weight: 500;">SCC One Status Search</span>
+                    <!-- ✅ MINI PROGRESS BAR SOTTO IL TESTO -->
+                    <div style="
+                        position: absolute;
+                        bottom: -3px;
+                        left: 0;
+                        right: 0;
+                        height: 2px;
+                        background: rgba(255,255,255,0.3);
+                        border-radius: 1px;
+                        overflow: hidden;
+                    ">
+                        <div style="
+                            width: ${Math.max(progress, 2)}%;
+                            height: 100%;
+                            background: rgba(255,255,255,0.9);
+                            border-radius: 1px;
+                            transition: width 0.3s ease;
+                        "></div>
+                    </div>
+                </div>
+            `;
+            toggleButton.style.fontSize = '14px';
+            toggleButton.style.lineHeight = 'normal';
+            toggleButton.style.padding = '8px 16px';
+            toggleButton.style.height = 'auto'; // ✅ Altezza naturale
+            debugLog(`Toggle button set to SEARCHING state - ${Math.round(progress)}%`);
+            break;
+
+        case 'completed':
+            toggleButton.classList.add('completed');
+            toggleButton.innerHTML = `
+                <div style="position: relative; display: inline-block;">
+                    <span style="font-size: 14px; font-weight: 500;">SCC One Status Search</span>
+                    <!-- ✅ BARRA COMPLETA SOTTO IL TESTO -->
+                    <div style="
+                        position: absolute;
+                        bottom: -3px;
+                        left: 0;
+                        right: 0;
+                        height: 2px;
+                        background: rgba(255,255,255,0.3);
+                        border-radius: 1px;
+                        overflow: hidden;
+                    ">
+                        <div style="
+                            width: 100%;
+                            height: 100%;
+                            background: rgba(255,255,255,0.95);
+                            border-radius: 1px;
+                        "></div>
+                    </div>
+                </div>
+            `;
+            toggleButton.style.fontSize = '14px';
+            toggleButton.style.lineHeight = 'normal';
+            toggleButton.style.padding = '8px 16px';
+            toggleButton.style.height = 'auto'; // ✅ Altezza naturale
+            debugLog('Toggle button set to COMPLETED state');
+            break;
+    }
+}
+
+
+// Auto-Update Functions
+function getCurrentVersion() {
+    return SCRIPT_VERSION;
+}
+
+function getLastUpdateCheck() {
+    const lastCheck = localStorage.getItem(UPDATE_CONFIG.STORAGE_KEY);
+    return lastCheck ? parseInt(lastCheck) : 0;
+}
+
+function setLastUpdateCheck() {
+    localStorage.setItem(UPDATE_CONFIG.STORAGE_KEY, Date.now().toString());
+}
+
+function compareVersions(current, latest) {
+    const currentParts = current.split('.').map(Number);
+    const latestParts = latest.split('.').map(Number);
+
+    for (let i = 0; i < Math.max(currentParts.length, latestParts.length); i++) {
+        const currentPart = currentParts[i] || 0;
+        const latestPart = latestParts[i] || 0;
+
+        if (latestPart > currentPart) return 1; // Update available
+        if (latestPart < currentPart) return -1; // Current is newer
+    }
+    return 0; // Same version
+}
+
+async function checkForUpdates() {
+    return new Promise((resolve) => {
+        try {
+            debugLog('🔄 Checking for script updates...');
+            debugLog(`📡 Fetching from: ${UPDATE_CONFIG.UPDATE_URL}`);
+
+            // ✅ USA GM_xmlhttpRequest invece di fetch per bypassare CORS
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: UPDATE_CONFIG.UPDATE_URL,
+                headers: {
+                    'Cache-Control': 'no-cache',
+                    'Pragma': 'no-cache'
+                },
+                onload: function(response) {
+                    try {
+                        debugLog(`📄 Retrieved ${response.responseText.length} characters`);
+                        debugLog(`📊 Response status: ${response.status}`);
+
+                        if (response.status !== 200) {
+                            throw new Error(`HTTP ${response.status}`);
+                        }
+
+                        const scriptContent = response.responseText;
+                        const versionMatch = scriptContent.match(/@version\s+([\d.]+)/);
+                        debugLog(`🔍 Version regex result:`, versionMatch);
+
+                        if (!versionMatch) {
+                            throw new Error('Could not parse version from remote script');
+                        }
+
+                        const latestVersion = versionMatch[1];
+                        const currentVersion = getCurrentVersion();
+
+                        debugLog(`📊 Version comparison - Current: v${currentVersion}, Latest: v${latestVersion}`);
+
+                        const comparison = compareVersions(currentVersion, latestVersion);
+                        debugLog(`⚖️ Comparison result: ${comparison} (1=update available, 0=same, -1=current newer)`);
+
+                        if (comparison === 1) {
+                            debugLog('🚀 Update available! Showing notification');
+                            showUpdateNotification(latestVersion);
+                            resolve(true);
+                        } else {
+                            debugLog('✅ Script is up to date');
+                            resolve(false);
+                        }
+
+                    } catch(error) {
+                        debugLog(`❌ Response processing failed: ${error.message}`);
+                        resolve(false);
+                    } finally {
+                        setLastUpdateCheck();
+                        debugLog('💾 Update check timestamp saved');
+                    }
+                },
+                onerror: function(error) {
+                    debugLog(`❌ Network error: ${error}`);
+                    setLastUpdateCheck();
+                    resolve(false);
+                },
+                ontimeout: function() {
+                    debugLog('❌ Request timed out');
+                    setLastUpdateCheck();
+                    resolve(false);
+                },
+                timeout: 10000 // 10 secondi timeout
+            });
+
+        } catch (error) {
+            debugLog(`❌ Update check failed: ${error.message}`);
+            setLastUpdateCheck();
+            resolve(false);
+        }
+    });
+}
+
+function showUpdateNotification(newVersion) {
+    // Remove existing notification if present
+    const existingNotification = document.getElementById('scc-update-notification');
+    if (existingNotification) {
+        existingNotification.remove();
+    }
+
+    const notification = document.createElement('div');
+    notification.id = 'scc-update-notification';
+    notification.innerHTML = `
+        <div style="
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: linear-gradient(135deg, #2ecc71, #27ae60);
+            color: white;
+            padding: 15px 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(46, 204, 113, 0.3);
+            z-index: 10000;
+            font-family: 'Amazon Ember', sans-serif;
+            max-width: 400px;
+            animation: slideInRight 0.5s ease;
+        ">
+            <div style="display: flex; align-items: center; margin-bottom: 10px;">
+                <span style="font-size: 24px; margin-right: 10px;">🚀</span>
+                <strong style="font-size: 16px;">SCC Script Update Available!</strong>
+            </div>
+            <div style="margin-bottom: 15px; font-size: 14px;">
+                New version <strong>v${newVersion}</strong> is available<br>
+                Current: <strong>v${getCurrentVersion()}</strong>
+            </div>
+            <div style="
+                margin-bottom: 15px;
+                padding: 10px;
+                background: rgba(255,255,255,0.1);
+                border-radius: 4px;
+                font-size: 12px;
+                line-height: 1.4;
+            ">
+                <strong>📋 Update Instructions:</strong><br>
+                1. Click "Update Now" below<br>
+                2. A new tab will open (may appear black)<br>
+                3. Tampermonkey will auto-install the update<br>
+                4. <strong>Refresh this page</strong> when done
+            </div>
+            <div style="display: flex; gap: 10px;">
+                <button id="update-now-btn" style="
+                    background: white;
+                    color: #27ae60;
+                    border: none;
+                    padding: 8px 15px;
+                    border-radius: 4px;
+                    cursor: pointer;
+                    font-weight: bold;
+                    flex: 1;
+                ">Update Now</button>
+                <button id="update-dismiss-btn" style="
+                    background: rgba(255,255,255,0.2);
+                    color: white;
+                    border: 1px solid rgba(255,255,255,0.3);
+                    padding: 8px 15px;
+                    border-radius: 4px;
+                    cursor: pointer;
+                    flex: 1;
+                ">Dismiss</button>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(notification);
+
+    // Add CSS animation
+    const style = document.createElement('style');
+    style.textContent = `
+        @keyframes slideInRight {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        @keyframes slideOutRight {
+            from { transform: translateX(0); opacity: 1; }
+            to { transform: translateX(100%); opacity: 0; }
+        }
+    `;
+    document.head.appendChild(style);
+
+    // Event handlers
+    document.getElementById('update-now-btn').addEventListener('click', () => {
+        // ✅ USA DOWNLOAD_URL per l'installazione effettiva
+        const updateTab = window.open(UPDATE_CONFIG.DOWNLOAD_URL, '_blank');
+
+        // Sostituisci la notifica con un messaggio di follow-up
+        showUpdateInProgressNotification();
+
+        // ⏰ OPZIONALE: Tenta di chiudere il tab dopo 5 secondi
+        setTimeout(() => {
+            try {
+                if (updateTab && !updateTab.closed) {
+                    updateTab.close();
+                }
+            } catch(e) {
+                debugLog('Could not auto-close update tab (browser security)');
+            }
+        }, 5000);
+
+        notification.remove();
+    });
+
+    document.getElementById('update-dismiss-btn').addEventListener('click', () => {
+        notification.style.animation = 'slideOutRight 0.3s ease';
+        setTimeout(() => notification.remove(), 300);
+    });
+
+    // Auto-dismiss dopo durata configurata
+    setTimeout(() => {
+        if (document.getElementById('scc-update-notification')) {
+            notification.style.animation = 'slideOutRight 0.3s ease';
+            setTimeout(() => notification.remove(), 300);
+        }
+    }, UPDATE_CONFIG.NOTIFICATION_DURATION);
+}
+
+// ✅ NUOVA FUNZIONE: Notifica di aggiornamento in corso
+function showUpdateInProgressNotification() {
+    const progressNotification = document.createElement('div');
+    progressNotification.id = 'scc-update-progress';
+    progressNotification.innerHTML = `
+        <div style="
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: linear-gradient(135deg, #3498db, #2980b9);
+            color: white;
+            padding: 15px 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(52, 152, 219, 0.3);
+            z-index: 10001;
+            font-family: 'Amazon Ember', sans-serif;
+            max-width: 380px;
+            animation: slideInRight 0.5s ease;
+        ">
+            <div style="display: flex; align-items: center; margin-bottom: 10px;">
+                <div style="
+                    width: 20px;
+                    height: 20px;
+                    border: 2px solid rgba(255,255,255,0.3);
+                    border-top: 2px solid white;
+                    border-radius: 50%;
+                    animation: spin 1s linear infinite;
+                    margin-right: 10px;
+                "></div>
+                <strong style="font-size: 16px;">Update in Progress...</strong>
+            </div>
+            <div style="font-size: 14px; line-height: 1.4;">
+                🔄 Tampermonkey is installing the update<br>
+                ⏳ Please wait a moment...<br>
+                <strong>🔄 Refresh this page when complete</strong>
+            </div>
+            <button id="refresh-page-btn" style="
+                margin-top: 15px;
+                width: 100%;
+                background: rgba(255,255,255,0.2);
+                color: white;
+                border: 1px solid rgba(255,255,255,0.3);
+                padding: 8px 15px;
+                border-radius: 4px;
+                cursor: pointer;
+                font-weight: bold;
+            ">Refresh Page Now</button>
+        </div>
+    `;
+
+    // Aggiungi CSS per l'animazione spinner
+    const spinnerStyle = document.createElement('style');
+    spinnerStyle.textContent = `
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    `;
+    document.head.appendChild(spinnerStyle);
+
+    document.body.appendChild(progressNotification);
+
+    // Event handler per refresh
+    document.getElementById('refresh-page-btn').addEventListener('click', () => {
+        location.reload();
+    });
+
+    // Auto-dismiss dopo 30 secondi
+    setTimeout(() => {
+        if (document.getElementById('scc-update-progress')) {
+            progressNotification.remove();
+        }
+    }, 30000);
+}
+
+// ✅ RILEVAMENTO AGGIORNAMENTO AUTOMATICO
+function checkIfUpdated() {
+    const lastKnownVersion = localStorage.getItem('scc_last_known_version');
+    const currentVersion = getCurrentVersion();
+
+    if (lastKnownVersion && lastKnownVersion !== currentVersion) {
+        // Script è stato aggiornato!
+        showUpdateCompleteNotification(lastKnownVersion, currentVersion);
+    }
+
+    // Salva la versione corrente
+    localStorage.setItem('scc_last_known_version', currentVersion);
+}
+
+function showUpdateCompleteNotification(oldVersion, newVersion) {
+    const successNotification = document.createElement('div');
+    successNotification.innerHTML = `
+        <div style="
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: linear-gradient(135deg, #27ae60, #2ecc71);
+            color: white;
+            padding: 15px 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(39, 174, 96, 0.4);
+            z-index: 10000;
+            font-family: 'Amazon Ember', sans-serif;
+            max-width: 350px;
+            animation: slideInRight 0.5s ease, successPulse 2s ease;
+        ">
+            <div style="display: flex; align-items: center; margin-bottom: 10px;">
+                <span style="font-size: 24px; margin-right: 10px;">✅</span>
+                <strong style="font-size: 16px;">Update Successful!</strong>
+            </div>
+            <div style="font-size: 14px;">
+                Updated from <strong>v${oldVersion}</strong> to <strong>v${newVersion}</strong><br>
+                🎉 Your script is now up to date!
+            </div>
+        </div>
+    `;
+
+    const successStyle = document.createElement('style');
+    successStyle.textContent = `
+        @keyframes successPulse {
+            0%, 100% { box-shadow: 0 4px 20px rgba(39, 174, 96, 0.4); }
+            50% { box-shadow: 0 4px 30px rgba(39, 174, 96, 0.8); }
+        }
+    `;
+    document.head.appendChild(successStyle);
+
+    document.body.appendChild(successNotification);
+
+    // Auto-dismiss dopo 5 secondi
+    setTimeout(() => {
+        successNotification.remove();
+    }, 5000);
+}
+
+function shouldCheckForUpdates() {
+    const now = Date.now();
+    const lastCheck = getLastUpdateCheck();
+    return (now - lastCheck) > UPDATE_CONFIG.CHECK_INTERVAL;
+}
+
+function initAutoUpdateCheck() {
+    if (shouldCheckForUpdates()) {
+        debugLog('Performing scheduled update check');
+        // Delay di 5 secondi per non interferire con l'inizializzazione
+        setTimeout(() => {
+            checkForUpdates();
+        }, 5000);
+    } else {
+        const nextCheck = new Date(getLastUpdateCheck() + UPDATE_CONFIG.CHECK_INTERVAL);
+        debugLog(`Next update check scheduled for: ${nextCheck.toLocaleString()}`);
+    }
+}
+
+console.log('[SCC] FINE SEZIONE 2: Utilities e funzioni di supporto');
+
+
+// ================================================================================================
+// SEZIONE 3: CREAZIONE ELEMENTI UI
+// ================================================================================================
+
+console.log('[SCC] INIZIO SEZIONE 3: Creazione elementi UI');
+
+function createToggleButton() {
+    debugLog('Creating toggle button');
+
+    const toggleButton = document.createElement('button');
+    toggleButton.id = 'sccSearchToggle';
+    toggleButton.textContent = 'SCC One Status Search';
+
+    toggleButton.style.cssText = `
+        margin-left: 10px;
+        padding: 8px 16px;
+        background-color: rgb(7, 115, 152);
+        color: white;
+        border: none;
+        border-radius: 3px;
+        cursor: pointer;
+        font-family: 'Amazon Ember', sans-serif;
+        font-size: 14px;
+        font-weight: 500;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+        transition: all 0.3s ease;
+        position: relative;
+        overflow: hidden;
+    `;
+
+    // Add hover effects
+    toggleButton.addEventListener('mouseover', () => {
+        if (!toggleButton.classList.contains('searching') && !toggleButton.classList.contains('completed')) {
+            toggleButton.style.backgroundColor = '#37475A';
+        }
+    });
+
+    toggleButton.addEventListener('mouseout', () => {
+        if (!toggleButton.classList.contains('searching') && !toggleButton.classList.contains('completed')) {
+            toggleButton.style.backgroundColor = 'rgb(7, 115, 152)';
+        }
+    });
+
+    return toggleButton;
+}
+
+function createTitleBar() {
+    const titleBar = document.createElement('div');
+    titleBar.id = 'sccDragHandle';
+    titleBar.innerHTML = `
+        <div style="display: flex; align-items: center; margin-right: auto;">
+            <img src="https://i.postimg.cc/1zjS2CL9/L-EU-PEX2.png"
+                 style="height: 30px; width: auto; margin-right: 8px;" />
+            <span>SCC One Status Search</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 15px;">
+            <span style="color: white; font-size: 11px; opacity: 0.8;">v${SCRIPT_VERSION}</span>
+            <button id="minimizeButton" style="
+                background: none;
+                border: none;
+                color: white !important;
+                cursor: pointer;
+                font-size: 16px;
+                padding: 0 5px;
+                filter: brightness(0) invert(1);
+                -webkit-filter: brightness(0) invert(1);
+            ">➖</button>
+        </div>
+    `;
+
+    titleBar.style.cssText = `
+        padding: 10px;
+        background: rgb(7, 115, 152);
+        color: white;
+        cursor: move;
+        user-select: none;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        border-top-left-radius: 8px;
+        border-top-right-radius: 8px;
+        font-weight: bold;
+    `;
+
+    return titleBar;
+}
+
+function createStateSelector() {
+    return `
+        <div style="margin-bottom: 15px;">
+            <select id="stateSelector" multiple style="
+                width: 100%;
+                padding: 8px;
+                border: 1px solid #ddd;
+                border-radius: 3px;
+                background-color: white;
+                font-size: 14px;
+                font-family: 'Amazon Ember', sans-serif;
+                color: var(--squidInk);
+                cursor: pointer;
+                font-weight: bold;
+                height: 150px;
+            ">
+                ${STATE_OPERATION_PAIRS.map((pair, index) =>
+                    `<option value="${index}"
+                        ${index === 0 ? 'disabled style="font-style: italic; font-weight: normal; background-color: #f0f0f0; color: #666;"' : 'style="font-weight: bold;"'}>
+                        ${pair.alias}
+                    </option>`
+                ).join('')}
+            </select>
+            <div id="stateSelectedCount" style="font-size: 12px; color: #666; margin-top: 4px; margin-bottom: 8px; transition: transform 0.2s ease;">
+                0 states selected
+            </div>
+            <div style="display: flex; gap: 8px; margin-bottom: 10px;">
+                <button id="selectAllStates" style="padding: 4px 8px; font-size: 12px; background-color: #f0f0f0; border: 1px solid #ddd; border-radius: 3px; cursor: pointer; transition: all 0.2s ease;">
+                    Select All
+                </button>
+                <button id="deselectAllStates" style="padding: 4px 8px; font-size: 12px; background-color: #f0f0f0; border: 1px solid #ddd; border-radius: 3px; cursor: pointer; transition: all 0.2s ease;">
+                    Deselect All
+                </button>
+            </div>
+        </div>
+    `;
+}
+
+function createDateFilter() {
+    return `
+        <div style="margin-top: 10px;">
+            <label style="display: flex; align-items: center; cursor: pointer;">
+                <input type="checkbox" id="enableDateFilter" style="margin-right: 8px;">
+                <span style="font-size: 14px;">Filter by Time Range</span>
+            </label>
+            <div id="dateFilterContainer" style="display: none; margin-top: 10px;">
+                <div style="display: flex; flex-direction: column; gap: 10px;">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                        <div>
+                            <label style="display: block; margin-bottom: 4px; font-size: 12px;">From Date</label>
+                            <input type="date" id="fromDate" style="width: 100%; padding: 6px; border: 1px solid #ddd; border-radius: 3px;">
+                        </div>
+                        <div>
+                            <label style="display: block; margin-bottom: 4px; font-size: 12px;">From Time</label>
+                            <select id="fromTime" style="width: 100%; padding: 6px; border: 1px solid #ddd; border-radius: 3px; background-color: white;">
+                                ${Array.from({length: 24}, (_, i) =>
+                                    `<option value="${String(i).padStart(2, '0')}:00">${String(i).padStart(2, '0')}:00</option>`
+                                ).join('')}
+                            </select>
+                        </div>
+                    </div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                        <div>
+                            <label style="display: block; margin-bottom: 4px; font-size: 12px;">To Date</label>
+                            <input type="date" id="toDate" style="width: 100%; padding: 6px; border: 1px solid #ddd; border-radius: 3px;">
+                        </div>
+                        <div>
+                            <label style="display: block; margin-bottom: 4px; font-size: 12px;">To Time</label>
+                            <select id="toTime" style="width: 100%; padding: 6px; border: 1px solid #ddd; border-radius: 3px; background-color: white;">
+                                ${Array.from({length: 24}, (_, i) =>
+                                    `<option value="${String(i).padStart(2, '0')}:00">${String(i).padStart(2, '0')}:00</option>`
+                                ).join('')}
+                            </select>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+function createTrackingInput() {
+    return `
+        <textarea id="trackingInput" placeholder="Enter Tracking Id"
+                  style="
+                    width: 100%;
+                    height: 100px;
+                    margin-top: 10px;
+                    margin-bottom: 10px;
+                    padding: 8px;
+                    border: 1px solid #ddd;
+                    border-radius: 3px;
+                    font-family: 'Amazon Ember', sans-serif;
+                    font-size: 14px;
+                    resize: vertical;
+                  "></textarea>
+        <div id="trackingCount" style="
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
+            margin-bottom: 10px;
+            padding-left: 2px;
+        ">0 tracking numbers</div>
+    `;
+}
+
+function createActionButtons() {
+    return `
+        <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+            <button id="searchButton" style="
+                flex: 1;
+                padding: 8px 16px;
+                background-color: rgb(7, 115, 152);
+                color: white;
+                border: none;
+                border-radius: 3px;
+                font-family: 'Amazon Ember', sans-serif;
+                font-weight: 500;
+                cursor: pointer;
+                transition: background-color 0.2s;
+                opacity: 0.5;
+                cursor: not-allowed;
+            ">Search</button>
+            <button id="clearButton" style="
+                flex: 1;
+                padding: 8px 16px;
+                background-color: #666;
+                color: white;
+                border: none;
+                border-radius: 3px;
+                font-family: 'Amazon Ember', sans-serif;
+                font-weight: 500;
+                cursor: pointer;
+                transition: background-color 0.2s;
+            ">Clear All</button>
+            <button id="refreshButton" style="
+                flex: 1;
+                padding: 8px 16px;
+                background-color: #666;
+                color: white;
+                border: none;
+                border-radius: 3px;
+                font-family: 'Amazon Ember', sans-serif;
+                font-weight: 500;
+                cursor: pointer;
+                transition: background-color 0.2s;
+                display: none;
+            ">Refresh</button>
+        </div>
+    `;
+}
+
+function createProgressIndicator() {
+    return `
+        <div id="progressContainer" style="
+            display: none;
+            margin-bottom: 15px;
+            background: #f5f5f5;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        ">
+            <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                <span style="color: #666; font-size: 14px;">Retrieving data...</span>
+                <div style="display: flex; align-items: center; gap: 15px;">
+                    <span id="timerText" style="color: #666; font-size: 14px;">Time: 00:00</span>
+                    <span id="progressText" style="color: rgb(7, 115, 152); font-weight: bold;">0%</span>
+                </div>
+            </div>
+            <div style="background-color: #e0e0e0; height: 6px; border-radius: 3px; overflow: hidden;">
+                <div id="progressBar" style="
+                    width: 0%;
+                    height: 100%;
+                    background: linear-gradient(90deg, rgb(7, 115, 152), rgb(17, 213, 103));
+                    transition: width 0.3s ease-in-out;
+                "></div>
+            </div>
+        </div>
+        <div id="completionTime" style="
+            display: none;
+            margin-top: 10px;
+            margin-bottom: 10px;
+            padding: 8px;
+            background: #e8f5e9;
+            border-radius: 4px;
+            color: #2e7d32;
+            font-size: 14px;
+            text-align: right;
+        ">Processing completed in: 00:00</div>
+    `;
+}
+
+function createIndicatorSummary() {
+    return `
+        <div id="indicatorSummary" style="
+            display: none;
+            margin: 15px 0;
+            padding: 15px;
+            background: linear-gradient(135deg, #f8f9fa, #e9ecef);
+            border-radius: 8px;
+            border: 1px solid #dee2e6;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        ">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                <h4 style="margin: 0; color: #495057; font-size: 14px; font-weight: 600;">
+                     Indicator's Summary
+                </h4>
+            </div>
+            <!-- Filtri che fungono anche da summary -->
+            <div id="filterButtons" style="display: flex; flex-wrap: wrap; gap: 8px;">
+                <!-- Pulsanti filtro/summary inseriti dinamicamente -->
+            </div>
+        </div>
+    `;
+}
+
+function createResultsTable() {
+    return `
+        <div id="results" style="overflow-x: auto;">
+            ${createIndicatorSummary()}
+            <table id="resultsTable" style="
+                width: 100%;
+                border-collapse: separate;
+                border-spacing: 0;
+                display: none;
+                font-size: 14px;
+                background: white;
+                border-radius: 8px;
+                overflow: hidden;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                margin-top: 15px;
+            ">
+                <thead>
+                    <tr>
+                        <th class="indicator-col" style="width: 36px; min-width: 36px; padding: 0; background: linear-gradient(180deg, #666666, #4d4d4d); border: 1px solid #555; position: sticky; top: 0;"></th>
+                        ${createTableHeaders()}
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+            <button id="exportButton" style="
+                margin-top: 10px;
+                width: 30%;
+                padding: 8px 16px;
+                background-color: rgb(17, 213, 103);
+                color: white;
+                border: none;
+                border-radius: 3px;
+                font-family: 'Amazon Ember', sans-serif;
+                font-weight: 500;
+                cursor: pointer;
+                transition: background-color 0.2s;
+                display: none;
+                margin-left: auto;
+                margin-right: auto;
+            ">Export to CSV</button>
+        </div>
+    `;
+}
+
+function createTableHeaders() {
+const headers = [
+    'Tracking ID', 'State DateTime', 'State', 'Source',
+    'Processed By', 'Sort Zone', 'Operation', 'Cycle', 'Reason', 'Days OOR'
+];
+
+
+    return headers.map((header, index) => `
+        <th style="
+            padding: 0;
+            background: linear-gradient(180deg, #666666, #4d4d4d);
+            color: white;
+            border: 1px solid #555;
+            user-select: none;
+            position: sticky;
+            top: 0;
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            ${header === 'State DateTime' ? 'white-space: nowrap;' : ''}
+        " data-sort="${index}">
+            <!-- ✅ HEADER CON SORT E FILTRO -->
+            <div style="
+                padding: 8px;
+                cursor: pointer;
+                border-bottom: 1px solid #555;
+                transition: background-color 0.2s;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+            " class="header-sort-area">
+                <span>${header}</span>
+                <span class="sort-indicator" style="display: inline-block; margin-left: 5px; font-size: 12px; opacity: 0.8;">↕</span>
+            </div>
+            <!-- ✅ INPUT FILTRO -->
+            <div style="padding: 4px;">
+                <input
+                    type="text"
+                    placeholder="Filter..."
+                    class="column-filter"
+                    data-column="${index}"
+                    style="
+                        width: 100%;
+                        padding: 4px 6px;
+                        border: none;
+                        border-radius: 3px;
+                        font-size: 11px;
+                        background: rgba(255,255,255,0.9);
+                        color: #333;
+                        outline: none;
+                        box-sizing: border-box;
+                    "
+                    onclick="event.stopPropagation();"
+                    onkeydown="event.stopPropagation();"
+                />
+            </div>
+        </th>
+    `).join('');
+}
+
+function createScrollTopButton(container) {
+    const scrollTopButton = document.createElement('button');
+    scrollTopButton.id = 'scrollTopButton';
+    scrollTopButton.innerHTML = '↑';
+
+    scrollTopButton.style.cssText = `
+        position: sticky;
+        bottom: 20px;
+        width: 45px;
+        height: 45px;
+        border-radius: 50%;
+        background-color: rgba(7, 115, 152, 0.4);
+        color: white;
+        border: none;
+        cursor: pointer;
+        display: none;
+        opacity: 0;
+        transition: all 0.3s ease;
+        z-index: 10000;
+        font-size: 24px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.15);
+        margin: 0 auto;
+        transform: translateY(-50px);
+    `;
+
+    // Add hover effects
+    scrollTopButton.addEventListener('mouseover', () => {
+        scrollTopButton.style.backgroundColor = 'rgba(55, 71, 90, 0.8)';
+        scrollTopButton.style.transform = 'translateY(-50px) scale(1.1)';
+    });
+
+    scrollTopButton.addEventListener('mouseout', () => {
+        scrollTopButton.style.backgroundColor = 'rgba(7, 115, 152, 0.4)';
+        scrollTopButton.style.transform = 'translateY(-50px) scale(1)';
+    });
+
+    // Scroll to top functionality
+    scrollTopButton.addEventListener('click', () => {
+        container.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+
+    // Show/hide button based on scroll
+    container.addEventListener('scroll', () => {
+        if (container.scrollTop > 300) {
+            scrollTopButton.style.display = 'block';
+            requestAnimationFrame(() => {
+                scrollTopButton.style.opacity = '1';
+            });
+        } else {
+            scrollTopButton.style.opacity = '0';
+            setTimeout(() => {
+                scrollTopButton.style.display = 'none';
+            }, 300);
+        }
+    });
+
+    return scrollTopButton;
+}
+
+console.log('[SCC] FINE SEZIONE 3: Creazione elementi UI');
+
+// ================================================================================================
+// SEZIONE 4: ASSEMBLAGGIO UI PRINCIPALE
+// ================================================================================================
+console.log('[SCC] INIZIO SEZIONE 4: Assemblaggio UI principale');
+
+function createUI() {
+    const container = document.createElement('div');
+    container.id = 'sccSearchContainer';
+
+    // Create title bar
+    const titleBar = createTitleBar();
+
+// Add minimize button functionality
+const minimizeButton = titleBar.querySelector('#minimizeButton');
+minimizeButton.onclick = () => container.style.display = 'none';
+
+    // Container styling
+    container.style.cssText = `
+        position: fixed;
+        top: 50px;
+        right: 10px;
+        width: auto;
+        min-width: 1000px;
+        max-width: 90vw;
+        background: white;
+        border: 1px solid rgba(0, 0, 0, 0.1);
+        border-radius: 8px;
+        z-index: 9999;
+        display: none;
+        max-height: 90vh;
+        overflow-y: auto;
+        font-family: "Amazon Ember", "Amazon Ember Arabic", Arial, sans-serif;
+        box-shadow: 0 4px 24px rgba(0,0,0,0.15);
+        transition: all 0.3s ease;
+        backdrop-filter: blur(5px);
+        background-color: rgba(255, 255, 255, 0.98);
+    `;
+
+    // Create content container
+    const contentContainer = document.createElement('div');
+    contentContainer.style.padding = '20px';
+    contentContainer.innerHTML =
+        createStateSelector() +
+        createDateFilter() +
+        createTrackingInput() +
+        createActionButtons() +
+        createProgressIndicator() +
+        createResultsTable();
+
+    // Create scroll top button wrapper
+    const buttonWrapper = document.createElement('div');
+    buttonWrapper.style.cssText = `
+        position: sticky;
+        bottom: 0;
+        width: 100%;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        padding-bottom: 20px;
+        pointer-events: none;
+        margin-top: -65px;
+    `;
+
+    const scrollTopButton = createScrollTopButton(container);
+    scrollTopButton.style.pointerEvents = 'auto';
+    buttonWrapper.appendChild(scrollTopButton);
+
+    // Assemble the container
+    container.appendChild(titleBar);
+    container.appendChild(contentContainer);
+    container.appendChild(buttonWrapper);
+
+    return container;
+}
+
+console.log('[SCC] FINE SEZIONE 4: Assemblaggio UI principale');
+
+// ================================================================================================
+// SEZIONE 5: GESTIONE EVENTI UI
+// ================================================================================================
+console.log('[SCC] INIZIO SEZIONE 5: Gestione eventi UI');
+
+function setupUIEventListeners(container) {
+    // Wait for DOM elements to be available
+    setTimeout(() => {
+        const stateSelector = container.querySelector('#stateSelector');
+        const searchButton = container.querySelector('#searchButton');
+        const trackingInput = container.querySelector('#trackingInput');
+        const enableDateFilter = container.querySelector('#enableDateFilter');
+        const dateFilterContainer = container.querySelector('#dateFilterContainer');
+        const selectedCountDiv = container.querySelector('#stateSelectedCount');
+        const selectAllStatesBtn = container.querySelector('#selectAllStates');
+        const deselectAllStatesBtn = container.querySelector('#deselectAllStates');
+        const trackingCountDiv = container.querySelector('#trackingCount');
+
+        // Tracking count update function
+        function updateTrackingCount() {
+            const input = trackingInput.value;
+            debugLog(`[COUNT] Input value: "${input}"`);
+            const trackingIds = extractTrackingNumbers(input);
+            const uniqueMatches = [...new Set(trackingIds)];
+            const count = uniqueMatches.length;
+            trackingCountDiv.textContent = `${count} unique tracking number${count !== 1 ? 's' : ''}`;
+
+            // Reset animation
+            setTimeout(() => {
+                trackingCountDiv.style.transform = 'scale(1)';
+            }, 200);
+        }
+
+        // Selected state count update function
+function updateSelectedCount() {
+    const count = Array.from(stateSelector.selectedOptions).length;
+    selectedCountDiv.textContent = `${count} state${count !== 1 ? 's' : ''} selected`;
+
+    // Feedback colore sottile (opzionale)
+    selectedCountDiv.style.color = '#077398';
+    setTimeout(() => {
+        selectedCountDiv.style.color = '#666';
+    }, 300);
+}
+
+
+        // Search button state update function
+        const updateSearchButtonState = () => {
+            const selectedStates = Array.from(stateSelector.selectedOptions);
+            const hasValidState = selectedStates.length > 0;
+
+            // Non usare trim, prendi il valore così com'è
+            const trackingIds = extractTrackingNumbers(trackingInput.value);
+            const uniqueMatches = [...new Set(trackingIds)];
+            const hasTrackings = uniqueMatches.length > 0;
+            const isEnabled = hasValidState && hasTrackings;
+
+            debugLog(`[BUTTON] States selected: ${hasValidState}, Trackings found: ${hasTrackings}, Button enabled: ${isEnabled}`);
+
+            searchButton.disabled = !isEnabled;
+            searchButton.style.opacity = isEnabled ? '1' : '0.5';
+            searchButton.style.cursor = isEnabled ? 'pointer' : 'not-allowed';
+        };
+
+        // Setup immediate update
+        const updateAll = () => {
+            updateTrackingCount();
+            updateSearchButtonState();
+        };
+
+        // Event Listeners - Multiple events to catch everything
+        trackingInput.addEventListener('input', updateAll);
+        trackingInput.addEventListener('keyup', updateAll);
+        trackingInput.addEventListener('paste', () => {
+            setTimeout(updateAll, 50); // Small delay for paste
+        });
+        trackingInput.addEventListener('change', updateAll);
+
+        selectAllStatesBtn.addEventListener('click', () => {
+            Array.from(stateSelector.options).forEach(option => {
+                if (!option.disabled) {
+                    option.selected = true;
+                }
+            });
+            updateSelectedCount();
+            updateSearchButtonState();
+        });
+
+        deselectAllStatesBtn.addEventListener('click', () => {
+            Array.from(stateSelector.options).forEach(option => {
+                option.selected = false;
+            });
+            updateSelectedCount();
+            updateSearchButtonState();
+        });
+
+        stateSelector.addEventListener('change', () => {
+            updateSelectedCount();
+            updateSearchButtonState();
+        });
+
+        // Date filter toggle functionality
+enableDateFilter.addEventListener('change', function(e) {
+    dateFilterContainer.style.display = e.target.checked ? 'block' : 'none';
+    if (e.target.checked) {
+        const today = new Date();
+        const currentDate = today.toISOString().split('T')[0];
+
+        // ✅ IMPOSTA DATA CORRENTE CON ORARIO 8:00-22:00
+        document.getElementById('fromDate').value = currentDate;
+        document.getElementById('toDate').value = currentDate;
+        document.getElementById('fromTime').value = '08:00';
+        document.getElementById('toTime').value = '22:00';
+
+        debugLog('Date filter activated with range 08:00-22:00 for today');
+    }
+});
+
+
+        // Hover effects for buttons
+        [selectAllStatesBtn, deselectAllStatesBtn].forEach(btn => {
+            btn.addEventListener('mouseover', () => {
+                btn.style.backgroundColor = '#e0e0e0';
+                btn.style.borderColor = '#bbb';
+            });
+            btn.addEventListener('mouseout', () => {
+                btn.style.backgroundColor = '#f0f0f0';
+                btn.style.borderColor = '#ddd';
+            });
+        });
+
+        // Initial states
+        updateSearchButtonState();
+        updateTrackingCount();
+    }, 0);
+}
+
+console.log('[SCC] FINE SEZIONE 5: Gestione eventi UI');
+
+// ================================================================================================
+// SEZIONE 6: DRAG & DROP FUNCTIONALITY
+// ================================================================================================
+console.log('[SCC] INIZIO SEZIONE 6: Drag & Drop functionality');
+
+function setupDragFunctionality(container, titleBar) {
+    let isDragging = false;
+    let currentX, currentY, initialX, initialY;
+    let xOffset = 0, yOffset = 0;
+
+    function dragStart(e) {
+        if (e.type === "touchstart") {
+            initialX = e.touches[0].clientX - xOffset;
+            initialY = e.touches[0].clientY - yOffset;
+        } else {
+            initialX = e.clientX - xOffset;
+            initialY = e.clientY - yOffset;
+        }
+
+        if (e.target === titleBar || e.target.parentElement === titleBar) {
+            isDragging = true;
+        }
+    }
+
+    function dragEnd() {
+        initialX = currentX;
+        initialY = currentY;
+        isDragging = false;
+    }
+
+    function drag(e) {
+        if (isDragging) {
+            e.preventDefault();
+
+            if (e.type === "touchmove") {
+                currentX = e.touches[0].clientX - initialX;
+                currentY = e.touches[0].clientY - initialY;
+            } else {
+                currentX = e.clientX - initialX;
+                currentY = e.clientY - initialY;
+            }
+
+            // Add viewport boundaries
+            const rect = container.getBoundingClientRect();
+            const viewport = {
+                width: window.innerWidth,
+                height: window.innerHeight
+            };
+
+            // Horizontal limits
+            if (currentX < -rect.width + 100) currentX = -rect.width + 100;
+            if (currentX > viewport.width - 100) currentX = viewport.width - 100;
+
+            // Vertical limits
+            if (currentY < 0) currentY = 0;
+            if (currentY > viewport.height - 100) currentY = viewport.height - 100;
+
+            xOffset = currentX;
+            yOffset = currentY;
+
+            setTranslate(currentX, currentY, container);
+        }
+    }
+
+    function setTranslate(xPos, yPos, el) {
+        el.style.transform = `translate3d(${xPos}px, ${yPos}px, 0)`;
+    }
+
+    // Add event listeners for drag
+    titleBar.addEventListener('mousedown', dragStart, false);
+    document.addEventListener('mousemove', drag, false);
+    document.addEventListener('mouseup', dragEnd, false);
+    titleBar.addEventListener('touchstart', dragStart, false);
+    document.addEventListener('touchmove', drag, false);
+    document.addEventListener('touchend', dragEnd, false);
+
+    return { xOffset, yOffset, setTranslate };
+}
+
+console.log('[SCC] FINE SEZIONE 6: Drag & Drop functionality');
+
+// ================================================================================================
+// SEZIONE 7: TABLE SORTING FUNCTIONALITY
+// ================================================================================================
+
+console.log('[SCC] INIZIO SEZIONE 7: Table sorting functionality');
+
+function setupTableSorting() {
+    const table = document.getElementById('resultsTable');
+    if (!table) return;
+
+    const headers = table.querySelectorAll('th[data-sort]');
+    let currentSortCol = null;
+    let currentSortDir = 'asc';
+
+    // ✅ SETUP SORTING (solo per area sort, non input)
+    function sortTable(columnIndex) {
+        debugLog(`Sorting table by column ${columnIndex}`);
+
+        const tbody = table.querySelector('tbody');
+        const rows = Array.from(tbody.querySelectorAll('tr:not([style*="display: none"])')); // Solo righe visibili
+        const header = headers[columnIndex];
+        const indicator = header.querySelector('.sort-indicator');
+
+        // Reset all indicators
+        headers.forEach(h => {
+            const ind = h.querySelector('.sort-indicator');
+            if (ind) ind.innerHTML = '↕';
+        });
+
+        // Update sort direction
+        if (currentSortCol === columnIndex) {
+            currentSortDir = currentSortDir === 'asc' ? 'desc' : 'asc';
+        } else {
+            currentSortCol = columnIndex;
+            currentSortDir = 'asc';
+        }
+
+        // Update current indicator
+        indicator.innerHTML = currentSortDir === 'asc' ? '↑' : '↓';
+
+        // Sort rows
+        rows.sort((a, b) => {
+            const aValue = a.cells[columnIndex + 1].textContent.trim(); // +1 because of indicator column
+            const bValue = b.cells[columnIndex + 1].textContent.trim();
+
+            // Special handling for date column (index 1)
+            if (columnIndex === 1 && aValue && bValue) {
+                const aDate = new Date(aValue);
+                const bDate = new Date(bValue);
+                return currentSortDir === 'asc' ? aDate - bDate : bDate - aDate;
+            }
+
+            // Normal string comparison for other columns
+            return currentSortDir === 'asc' ?
+                aValue.localeCompare(bValue) :
+                bValue.localeCompare(aValue);
+        });
+
+        // Re-append sorted rows (mantenendo lo stato di visibilità)
+        rows.forEach(row => tbody.appendChild(row));
+
+        debugLog(`Table sorted by column ${columnIndex} in ${currentSortDir} order`);
+    }
+
+    // ✅ SETUP FILTRI COLONNA
+    function setupColumnFilters() {
+        const filterInputs = table.querySelectorAll('.column-filter');
+
+        filterInputs.forEach(input => {
+            // Debounced filter function
+            const debouncedFilter = debounce(() => {
+                applyColumnFilters();
+            }, CONFIG.DEBOUNCE_DELAY);
+
+            input.addEventListener('input', debouncedFilter);
+            input.addEventListener('keyup', debouncedFilter);
+        });
+    }
+
+    function applyColumnFilters() {
+        const tbody = table.querySelector('tbody');
+        const rows = tbody.querySelectorAll('tr');
+        const filterInputs = table.querySelectorAll('.column-filter');
+
+        // Raccogli tutti i filtri attivi
+        const activeFilters = [];
+        filterInputs.forEach(input => {
+            const value = input.value.trim().toLowerCase();
+            if (value) {
+                activeFilters.push({
+                    column: parseInt(input.dataset.column),
+                    value: value
+                });
+            }
+        });
+
+        debugLog(`Applying ${activeFilters.length} column filters`);
+
+        // Applica filtri a ogni riga
+        let visibleCount = 0;
+        rows.forEach(row => {
+            let showRow = true;
+
+            // Controlla ogni filtro attivo
+            for (const filter of activeFilters) {
+                const cellIndex = filter.column + 1; // +1 per colonna indicatori
+                const cell = row.cells[cellIndex];
+
+                if (cell) {
+                    const cellText = cell.textContent.trim().toLowerCase();
+
+                    // ✅ RICERCA "LIKE" (contiene il testo)
+                    if (!cellText.includes(filter.value)) {
+                        showRow = false;
+                        break; // Se anche solo un filtro non matcha, nascondi la riga
+                    }
+                }
+            }
+
+            // Applica visibilità
+            row.style.display = showRow ? '' : 'none';
+            if (showRow) visibleCount++;
+        });
+
+        // ✅ AGGIORNA CONTATORE VISIBILE
+        updateFilterSummary(visibleCount, rows.length, activeFilters.length);
+    }
+
+    function updateFilterSummary(visible, total, activeFiltersCount) {
+        // Trova o crea area per il summary filtri
+        let filterSummary = table.parentElement.querySelector('#column-filter-summary');
+
+        if (!filterSummary) {
+            filterSummary = document.createElement('div');
+            filterSummary.id = 'column-filter-summary';
+            filterSummary.style.cssText = `
+                margin-top: 10px;
+                padding: 8px 12px;
+                background: #f8f9fa;
+                border-radius: 4px;
+                font-size: 12px;
+                color: #666;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                border: 1px solid #dee2e6;
+            `;
+            table.parentElement.insertBefore(filterSummary, table.nextSibling);
+        }
+
+        if (activeFiltersCount > 0) {
+            filterSummary.style.display = 'flex';
+            filterSummary.innerHTML = `
+                <span>Showing <strong>${visible}</strong> of <strong>${total}</strong> results</span>
+                <button id="clearAllFilters" style="
+                    padding: 4px 8px;
+                    background: #dc3545;
+                    color: white;
+                    border: none;
+                    border-radius: 3px;
+                    cursor: pointer;
+                    font-size: 11px;
+                    transition: all 0.2s ease;
+                ">Clear Filters</button>
+            `;
+
+            // Event listener per clear filters
+            const clearButton = filterSummary.querySelector('#clearAllFilters');
+            clearButton.addEventListener('click', clearAllFilters);
+        } else {
+            filterSummary.style.display = 'none';
+        }
+    }
+
+    function clearAllFilters() {
+        const filterInputs = table.querySelectorAll('.column-filter');
+        filterInputs.forEach(input => input.value = '');
+
+        const tbody = table.querySelector('tbody');
+        const rows = tbody.querySelectorAll('tr');
+        rows.forEach(row => row.style.display = '');
+
+        const filterSummary = table.parentElement.querySelector('#column-filter-summary');
+        if (filterSummary) filterSummary.style.display = 'none';
+
+        debugLog('All column filters cleared');
+    }
+
+    // ✅ SETUP CLICK HANDLERS PER SORT (solo area header)
+    headers.forEach((header, index) => {
+        const sortArea = header.querySelector('.header-sort-area');
+        if (sortArea) {
+            sortArea.addEventListener('click', () => {
+                debugLog(`Header clicked: ${index}`);
+                sortTable(index);
+            });
+        }
+    });
+
+    // ✅ SETUP FILTRI
+    setupColumnFilters();
+}
+
+console.log('[SCC] FINE SEZIONE 7: Table sorting functionality');
+
+
+// ================================================================================================
+// SEZIONE 8: STYLES E CSS
+// ================================================================================================
+
+console.log('[SCC] INIZIO SEZIONE 8: Styles e CSS');
+
+function addCustomStyles() {
+    const style = document.createElement('style');
+    style.textContent = `
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(-10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .result-row {
+            animation: fadeIn 0.3s ease-out forwards;
+            transition: transform 0.2s ease-in-out;
+            background-color: transparent;
+        }
+
+        .result-row td {
+            background-color: inherit !important;
+            padding: 12px 8px;
+            border-bottom: 1px solid #eee;
+        }
+
+        .result-row:hover {
+            background-color: #f5f9ff !important;
+            transform: translateY(-1px);
+        }
+
+        .result-row:hover a {
+            color: rgb(7, 115, 152) !important;
+            text-decoration: underline !important;
+        }
+
+        /* Indicator column */
+        .indicator-col {
+            width: 36px;
+            min-width: 36px;
+            text-align: center;
+            padding: 0 !important;
+            background-color: #fafafa;
+            vertical-align: middle;
+        }
+
+        /* Generic indicator dot */
+        .row-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 2px;
+            margin: 0 auto 2px auto;
+            display: block;
+        }
+
+        /* Specific indicators */
+        .indicator-linked-package {
+            background-color: #ffcc00;
+        }
+
+        .indicator-scrub-bag {
+            background-color: #ff9800;
+        }
+
+        .indicator-redirected { /* ✅ NUOVO */
+            background-color: #9C27B0;
+        }
+
+        .indicator-high-value {
+            background-color: #228B22;
+        }
+
+        .indicator-otp {
+            background-color: #DC143C;
+        }
+        .indicator-mnr {
+    background-color: #FF5722;
+}
+
+.indicator-route-manual {
+    background-color: #8B4513;
+}
+
+        /* Toggle button styles */
+        .toggle-option {
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .toggle-option:hover:not(.active) {
+            background: rgba(0, 0, 0, 0.05) !important;
+        }
+
+        .toggle-option div {
+            transition: all 0.2s ease;
+        }
+
+        /* Summary panel animations */
+        #indicatorSummary {
+            transition: all 0.3s ease;
+        }
+
+        /* Toggle Button States */
+        #sccSearchToggle {
+            position: relative;
+            overflow: hidden;
+        }
+
+        /* Loading State con effetto pulsante */
+        #sccSearchToggle.searching {
+            background: linear-gradient(45deg, #ff6b35, #f7931e, #ff6b35, #f7931e) !important;
+            background-size: 400% 400% !important;
+            animation: searchingGradient 2s ease infinite !important;
+            box-shadow: 0 0 20px rgba(255, 107, 53, 0.5) !important;
+        }
+
+        #sccSearchToggle.searching::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1), transparent);
+            animation: searchingShine 3s ease-in-out infinite;
+        }
+
+        /* Completed State */
+        #sccSearchToggle.completed {
+            background: linear-gradient(135deg, #11d567, #2ecc71) !important;
+            box-shadow: 0 0 20px rgba(17, 213, 103, 0.5) !important;
+            animation: completedPulse 2s ease infinite !important;
+        }
+
+/* ✅ STILI PER FILTRI COLONNA - FIX ALTEZZA UNIFORME */
+.column-filter {
+    transition: all 0.2s ease;
+    height: 24px !important;
+    min-height: 24px !important;
+    max-height: 24px !important;
+    box-sizing: border-box !important;
+    line-height: 1.2 !important;
+    font-size: 11px !important;
+    vertical-align: middle !important;
+}
+
+.column-filter:focus {
+    background: white !important;
+    box-shadow: 0 0 0 2px rgba(7, 115, 152, 0.3) !important;
+    height: 24px !important;
+}
+
+.column-filter:hover {
+    background: white !important;
+    height: 24px !important;
+}
+
+/* ✅ Container dei filtri con altezza uniforme */
+th > div:last-child {
+    height: 32px !important;
+    display: flex !important;
+    align-items: center !important;
+    padding: 4px !important;
+}
+
+
+        .column-filter:focus {
+            background: white !important;
+            box-shadow: 0 0 0 2px rgba(7, 115, 152, 0.3) !important;
+        }
+
+        .column-filter:hover {
+            background: white !important;
+        }
+
+        /* Header hover effects */
+        .header-sort-area:hover {
+            background-color: rgba(255,255,255,0.1) !important;
+        }
+
+        /* Filter summary styling */
+        #column-filter-summary {
+            transition: all 0.3s ease;
+        }
+
+        #clearAllFilters:hover {
+            background: #c82333 !important;
+            transform: scale(1.02);
+        }
+
+        /* Animations */
+        @keyframes searchingGradient {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+
+        @keyframes searchingShine {
+            0% { left: -100%; }
+            100% { left: 100%; }
+        }
+
+        @keyframes completedPulse {
+            0%, 100% {
+                box-shadow: 0 0 20px rgba(17, 213, 103, 0.5);
+                transform: scale(1);
+            }
+            50% {
+                box-shadow: 0 0 30px rgba(17, 213, 103, 0.8);
+                transform: scale(1.02);
+            }
+        }
+
+    `;
+
+    document.head.appendChild(style);
+}
+
+console.log('[SCC] FINE SEZIONE 8: Styles e CSS');
+
+
+// ================================================================================================
+// SEZIONE 9: API E RICHIESTE HTTP
+// ================================================================================================
+
+console.log('[SCC] INIZIO SEZIONE 9: API e richieste HTTP');
+
+function makeRequest(trackingId) {
+    const currentDomain = window.location.hostname;
+    const baseUrl = `https://${currentDomain}`;
+
+    return Promise.all([
+        // Prima chiamata - Storia del pacco
+        makePackageHistoryRequest(baseUrl, trackingId),
+        // Seconda chiamata per i dettagli del pacco
+        makePackageDetailRequest(baseUrl, trackingId)
+    ]);
+}
+
+function makePackageHistoryRequest(baseUrl, trackingId) {
+    return new Promise((resolve) => {
+        // Controlla se già cancellato
+        if (window.abortController?.signal.aborted) {
+            resolve({
+                error: true,
+                errorType: 'CANCELLED',
+                message: 'Request cancelled',
+                packageHistory: []
+            });
+            return;
+        }
+
+        // ✅ RETRY LOGIC MIGLIORATA
+        let retryCount = 0;
+        const maxRetries = CONFIG.MAX_RETRIES;
+
+        const attemptRequest = () => {
+            debugLog(`[REQUEST] ${trackingId} - Attempt ${retryCount + 1}/${maxRetries}`);
+
+            const request = GM_xmlhttpRequest({
+                method: 'POST',
+                url: `${baseUrl}/station/proxyapigateway/data`,
+                data: JSON.stringify({
+                    resourcePath: "/os/getPackageHistoryData",
+                    httpMethod: "post",
+                    processName: "oculus",
+                    requestBody: {
+                        packageId: trackingId,
+                        pageSize: 100,
+                        pageToken: null
+                    }
+                }),
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'Origin': baseUrl,
+                    'Referer': `${baseUrl}/station/dashboard/search`,
+                    // ✅ AGGIUNGI HEADERS PER STABILITÀ
+                    'Cache-Control': 'no-cache',
+                    'Pragma': 'no-cache'
+                },
+                onload: function(response) {
+                    handlePackageHistoryResponse(response, trackingId, resolve, retryCount, maxRetries, attemptRequest);
+                },
+                onerror: function(error) {
+                    retryCount++;
+                    debugLog(`[REQUEST ERROR] ${trackingId} - Attempt ${retryCount}: ${error}`);
+
+                    if (retryCount < maxRetries && !window.abortController?.signal.aborted) {
+                        const delay = CONFIG.RETRY_DELAY * Math.pow(1.5, retryCount - 1); // Exponential backoff
+                        debugLog(`[REQUEST RETRY] ${trackingId} - Retrying in ${delay}ms...`);
+                        setTimeout(attemptRequest, delay);
+                    } else {
+                        resolve({
+                            error: true,
+                            errorType: 'NETWORK_ERROR',
+                            message: `Network error after ${maxRetries} attempts: ${error}`,
+                            packageHistory: []
+                        });
+                    }
+                },
+                timeout: CONFIG.REQUEST_TIMEOUT,
+                ontimeout: function() {
+                    retryCount++;
+                    debugLog(`[REQUEST TIMEOUT] ${trackingId} - Attempt ${retryCount} timed out`);
+
+                    if (retryCount < maxRetries && !window.abortController?.signal.aborted) {
+                        const delay = CONFIG.RETRY_DELAY * Math.pow(1.5, retryCount - 1);
+                        debugLog(`[REQUEST RETRY] ${trackingId} - Retrying in ${delay}ms after timeout...`);
+                        setTimeout(attemptRequest, delay);
+                    } else {
+                        resolve({
+                            error: true,
+                            errorType: 'TIMEOUT_ERROR',
+                            message: `Request timed out after ${maxRetries} attempts (${CONFIG.REQUEST_TIMEOUT}ms each)`,
+                            packageHistory: []
+                        });
+                    }
+                }
+            });
+
+            // Listener per abort
+            if (window.abortController) {
+                window.abortController.signal.addEventListener('abort', () => {
+                    if (request.abort) {
+                        request.abort();
+                    }
+                    resolve({
+                        error: true,
+                        errorType: 'CANCELLED',
+                        message: 'Request cancelled by user',
+                        packageHistory: []
+                    });
+                });
+            }
+        };
+
+        // Inizio primo tentativo
+        attemptRequest();
+    });
+}
+
+function makePackageDetailRequest(baseUrl, trackingId) {
+    return new Promise((resolve) => {
+        // Controlla se già cancellato
+        if (window.abortController?.signal.aborted) {
+            resolve({
+                error: true,
+                errorType: 'CANCELLED',
+                message: 'Request cancelled'
+            });
+            return;
+        }
+
+        // ✅ RETRY LOGIC ANCHE PER DETAIL REQUEST
+        let retryCount = 0;
+        const maxRetries = CONFIG.MAX_RETRIES;
+
+        const attemptRequest = () => {
+            const request = GM_xmlhttpRequest({
+                method: 'POST',
+                url: `${baseUrl}/station/proxyapigateway/data`,
+                data: JSON.stringify({
+                    resourcePath: "/os/getPackageDetailData",
+                    httpMethod: "get",
+                    processName: "oculus",
+                    requestParams: {
+                        trackingId: [trackingId]
+                    }
+                }),
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'Cache-Control': 'no-cache',
+                    'Pragma': 'no-cache'
+                },
+                onload: function(response) {
+                    try {
+                        const data = JSON.parse(response.responseText);
+                        resolve(data);
+                    } catch(e) {
+                        retryCount++;
+                        if (retryCount < maxRetries && !window.abortController?.signal.aborted) {
+                            const delay = CONFIG.RETRY_DELAY * Math.pow(1.5, retryCount - 1);
+                            setTimeout(attemptRequest, delay);
+                        } else {
+                            resolve({
+                                error: true,
+                                message: `Parse error after ${maxRetries} attempts: ${e.message}`
+                            });
+                        }
+                    }
+                },
+                onerror: function(error) {
+                    retryCount++;
+                    if (retryCount < maxRetries && !window.abortController?.signal.aborted) {
+                        const delay = CONFIG.RETRY_DELAY * Math.pow(1.5, retryCount - 1);
+                        setTimeout(attemptRequest, delay);
+                    } else {
+                        resolve({
+                            error: true,
+                            message: `Network error after ${maxRetries} attempts: ${error}`
+                        });
+                    }
+                },
+                timeout: CONFIG.REQUEST_TIMEOUT,
+                ontimeout: function() {
+                    retryCount++;
+                    if (retryCount < maxRetries && !window.abortController?.signal.aborted) {
+                        const delay = CONFIG.RETRY_DELAY * Math.pow(1.5, retryCount - 1);
+                        setTimeout(attemptRequest, delay);
+                    } else {
+                        resolve({
+                            error: true,
+                            message: `Timeout after ${maxRetries} attempts`
+                        });
+                    }
+                }
+            });
+
+            // Listener per abort
+            if (window.abortController) {
+                window.abortController.signal.addEventListener('abort', () => {
+                    if (request.abort) {
+                        request.abort();
+                    }
+                    resolve({
+                        error: true,
+                        errorType: 'CANCELLED',
+                        message: 'Request cancelled by user'
+                    });
+                });
+            }
+        };
+
+        attemptRequest();
+    });
+}
+
+function handlePackageHistoryResponse(response, trackingId, resolve, retryCount = 0, maxRetries = CONFIG.MAX_RETRIES, attemptRequest = null) {
+    try {
+        // ✅ GESTIONE MIGLIORATA STATUS CODES
+        debugLog(`[RESPONSE] ${trackingId} - Status: ${response.status}, Length: ${response.responseText?.length || 0}`);
+
+        // Gestione esplicita del 404 - pacco non trovato
+        if (response.status === 404) {
+            resolve({
+                error: true,
+                errorType: 'NOT_FOUND',
+                message: 'Package not found in system',
+                packageHistory: []
+            });
+            return;
+        }
+
+        // ✅ GESTIONE STATUS CODES PROBLEMATICI
+        if (response.status >= 500 && response.status < 600) {
+            // Server error - retry se possibile
+            if (retryCount < maxRetries && attemptRequest) {
+                retryCount++;
+                const delay = CONFIG.RETRY_DELAY * Math.pow(1.5, retryCount - 1);
+                debugLog(`[SERVER ERROR] ${trackingId} - Status ${response.status}, retrying in ${delay}ms...`);
+                setTimeout(attemptRequest, delay);
+                return;
+            } else {
+                resolve({
+                    error: true,
+                    errorType: 'SERVER_ERROR',
+                    message: `Server error: ${response.status}`,
+                    packageHistory: []
+                });
+                return;
+            }
+        }
+
+        if (response.status === 429) {
+            // Rate limited - retry con delay maggiore
+            if (retryCount < maxRetries && attemptRequest) {
+                retryCount++;
+                const delay = CONFIG.RETRY_DELAY * Math.pow(2, retryCount); // Exponential backoff più aggressivo
+                debugLog(`[RATE LIMITED] ${trackingId} - Retrying in ${delay}ms...`);
+                setTimeout(attemptRequest, delay);
+                return;
+            } else {
+                resolve({
+                    error: true,
+                    errorType: 'RATE_LIMITED',
+                    message: 'Rate limited - too many requests',
+                    packageHistory: []
+                });
+                return;
+            }
+        }
+
+        const tryParseJSON = () => {
+            try {
+                debugLog(`[PARSE] ${trackingId} - Response preview: ${response.responseText.slice(0, 100)}`);
+
+                if (!response.responseText || response.responseText.trim() === '') {
+                    throw new Error('Empty response received');
+                }
+
+                let cleanResponse = response.responseText
+                    .trim()
+                    .replace(/^\s+|\s+$/g, '')
+                    .replace(/[\u0000-\u001F]/g, '')
+                    .replace(/\ufeff/g, '');
+
+                if (!/^[\[\{"]/.test(cleanResponse)) {
+                    debugLog(`[PARSE WARNING] ${trackingId} - Invalid JSON start: ${cleanResponse.slice(0, 50)}`);
+                    const jsonStart = cleanResponse.match(/[\[\{\"]/);
+                    if (jsonStart) {
+                        cleanResponse = cleanResponse.slice(jsonStart.index);
+                    }
+                }
+
+                const data = JSON.parse(cleanResponse);
+
+                if (!data) {
+                    throw new Error('Parsed data is null or undefined');
+                }
+
+                // Controlla se la risposta indica che il pacco non esiste
+                if (data.error || (data.packageHistory && data.packageHistory.length === 0)) {
+                    resolve({
+                        error: true,
+                        errorType: 'NOT_FOUND',
+                        message: 'Package not found in system',
+                        packageHistory: []
+                    });
+                    return;
+                }
+
+                if (!data.packageHistory) {
+                    throw new Error('Missing packageHistory in response');
+                }
+
+                if (!Array.isArray(data.packageHistory)) {
+                    throw new Error('packageHistory is not an array');
+                }
+
+                debugLog(`[PARSE SUCCESS] ${trackingId} - Found ${data.packageHistory.length} history events`);
+                resolve(data);
+
+            } catch(e) {
+                debugLog(`[PARSE ERROR] ${trackingId} - ${e.message}`);
+
+                // Retry parsing se possibile
+                if (retryCount < maxRetries && attemptRequest) {
+                    retryCount++;
+                    const delay = CONFIG.RETRY_DELAY * Math.pow(1.5, retryCount - 1);
+                    debugLog(`[PARSE RETRY] ${trackingId} - Retrying in ${delay}ms...`);
+                    setTimeout(attemptRequest, delay);
+                } else {
+                    // Distingui tra errori di rete e pacchi non trovati
+                    const isNotFoundError = e.message.includes('Missing packageHistory') ||
+                        e.message.includes('not found') ||
+                        e.message.includes('Empty response');
+
+                    resolve({
+                        error: true,
+                        errorType: isNotFoundError ? 'NOT_FOUND' : 'PARSE_ERROR',
+                        message: isNotFoundError ?
+                            'Package not found in system' :
+                            `Parse error after ${maxRetries} attempts: ${e.message}`,
+                        packageHistory: []
+                    });
+                }
+            }
+        };
+
+        tryParseJSON();
+
+    } catch(e) {
+        resolve({
+            error: true,
+            errorType: 'RESPONSE_HANDLER_ERROR',
+            message: `Response handler error: ${e.message}`,
+            packageHistory: []
+        });
+    }
+}
+
+console.log('[SCC] FINE SEZIONE 9: API e richieste HTTP');
+
+
+// ================================================================================================
+// SEZIONE 10: DATA PROCESSING
+// ================================================================================================
+
+console.log('[SCC] INIZIO SEZIONE 10: Data processing');
+
+// ✅ NUOVA FUNZIONE: Calcola Days OOR (Days on the Road)
+function calculateDaysOOR(packageHistory) {
+    if (!packageHistory || !Array.isArray(packageHistory)) {
+        return 0;
+    }
+
+    // Filtra eventi IN_TRANSIT con PACKAGE_STATE_UPDATE E destination CUSTOMER_ADDRESS
+    const inTransitEvents = packageHistory.filter(event => {
+        const stateMatch = event.packageState === 'IN_TRANSIT';
+        const operationMatch = Array.isArray(event.operation) ?
+            event.operation.includes('PACKAGE_STATE_UPDATE') :
+            event.operation === 'PACKAGE_STATE_UPDATE';
+
+        // ✅ NUOVO: Controlla anche destination
+        const destinationMatch = event.destination &&
+            event.destination.toLowerCase().includes('customer_address');
+
+        return stateMatch && operationMatch && destinationMatch;
+    });
+
+    if (inTransitEvents.length === 0) {
+        debugLog(`[Days OOR] No IN_TRANSIT events with CUSTOMER_ADDRESS destination found`);
+        return 0;
+    }
+
+    // Estrai date uniche (senza orario)
+    const uniqueDates = new Set();
+    inTransitEvents.forEach(event => {
+        if (event.stateTime) {
+            const eventDate = new Date(event.stateTime);
+            const dateString = eventDate.toISOString().split('T')[0];
+            uniqueDates.add(dateString);
+            debugLog(`[Days OOR] Found IN_TRANSIT to CUSTOMER_ADDRESS on ${dateString}: ${event.stateTime}`);
+        }
+    });
+
+    const daysCount = uniqueDates.size;
+    debugLog(`[Days OOR] Found ${inTransitEvents.length} IN_TRANSIT to CUSTOMER_ADDRESS events across ${daysCount} unique days`);
+    return daysCount;
+}
+
+
+// ✅ FUNZIONE OTTIMIZZATA PER CREAZIONE RIGHE
+function createResultRow(result) {
+    const row = document.createElement('tr');
+    row.className = 'result-row';
+
+    // ✅ DATASET ATTRIBUTES (ottimizzato)
+    const indicators = result.indicators || [];
+    row.dataset.indicators = JSON.stringify(indicators.map(ind => ind.type));
+
+    // Set individual indicator flags (ottimizzato con oggetto)
+    const indicatorFlags = {
+        'linked-package': 'hasLinked',
+        'scrub-bag': 'hasScrubBag',
+        'redirected': 'hasRedirected',
+        'high-value': 'hasHighValue',
+        'otp': 'hasOtp',
+        'mnr': 'hasMnr',
+        'route-manual': 'hasRouteManual' // ✅ NUOVO INDICATORE
+    };
+
+    // Reset all flags
+    Object.values(indicatorFlags).forEach(flag => row.dataset[flag] = 'false');
+
+    // Set active flags
+    indicators.forEach(indicator => {
+        const flag = indicatorFlags[indicator.type];
+        if (flag) row.dataset[flag] = 'true';
+    });
+
+    // ✅ CELL CREATION OTTIMIZZATA
+    let trackingCell = '';
+    let stateStyle = '';
+
+    if (result.state === 'No System data') {
+        trackingCell = `<span style="color: #d32f2f; font-weight: 500;">${result.tracking}</span>`;
+        stateStyle = 'color: #d32f2f; font-weight: 500;';
+    } else {
+        trackingCell = `<a href="https://logistics.amazon.co.uk/station/dashboard/search?shareableLink=detailPage%2F${result.tracking}" target="_blank" style="color: rgb(7, 115, 152); text-decoration: none; font-weight: 500;">${result.tracking}</a>`;
+    }
+
+    // ✅ INDICATORS HTML (ottimizzato con template string singola)
+    const indicatorHTML = indicators.map(indicator =>
+        `<div class="row-indicator indicator-${indicator.type}" style="background-color: ${indicator.color};" title="${indicator.description}"></div>`
+    ).join('');
+
+    // ✅ DAYS OOR STYLING
+    const daysOORStyle = result.daysOOR > 2 ?
+        'text-align: center; font-weight: 600; color: #d32f2f;' :
+        result.daysOOR === 0 ?
+        'text-align: center; font-weight: normal; color: #999;' :
+        'text-align: center; font-weight: normal;';
+
+    const daysOORValue = result.daysOOR > 0 ? result.daysOOR : '-';
+
+    // ✅ ROW HTML TEMPLATE (ottimizzato)
+    row.innerHTML = `
+    <td class="indicator-col">${indicatorHTML}</td>
+    <td style="padding: 12px 8px; border-bottom: 1px solid #eee;">${trackingCell}</td>
+    <td style="padding: 12px 8px; border-bottom: 1px solid #eee;">${result.stateTime}</td>
+    <td style="padding: 12px 8px; border-bottom: 1px solid #eee; ${stateStyle}">${result.state}</td>
+    <td style="padding: 12px 8px; border-bottom: 1px solid #eee;">${result.source}</td>
+    <td style="padding: 12px 8px; border-bottom: 1px solid #eee; ${!result.eventProcessedBy ? 'background-color: #ffffff;' : ''}">${result.eventProcessedBy || ''}</td>
+    <td style="padding: 12px 8px; border-bottom: 1px solid #eee;">${result.sortZone}</td>
+    <td style="padding: 12px 8px; border-bottom: 1px solid #eee;">${result.operation}</td>
+    <td style="padding: 12px 8px; border-bottom: 1px solid #eee;">${result.cycle}</td>
+    <td style="padding: 12px 8px; border-bottom: 1px solid #eee;">${result.additionalInfo}</td>
+    <td style="padding: 12px 8px; border-bottom: 1px solid #eee; ${daysOORStyle}">${daysOORValue}</td>
+    `;
+
+    return row;
+}
+
+function findMostRecentStates(history, selectedIndices) {
+    if (!history || !Array.isArray(history)) {
+        debugLog('Invalid history data');
+        return [];
+    }
+
+    const selectedPairs = selectedIndices.map(index => {
+        const idx = parseInt(index);
+        return STATE_OPERATION_PAIRS[idx];
+    }).filter(pair => pair && pair.state);
+
+    const dateFilterEnabled = document.getElementById('enableDateFilter').checked;
+    let fromDate = null;
+    let toDate = null;
+
+    if (dateFilterEnabled) {
+        const fromDateStr = document.getElementById('fromDate').value;
+        const fromTimeStr = document.getElementById('fromTime').value || '00:00';
+        const toDateStr = document.getElementById('toDate').value;
+        const toTimeStr = document.getElementById('toTime').value || '23:59';
+
+        if (fromDateStr) fromDate = new Date(`${fromDateStr}T${fromTimeStr}`);
+        if (toDateStr) toDate = new Date(`${toDateStr}T${toTimeStr}`);
+    }
+
+    const results = [];
+
+    for (const pair of selectedPairs) {
+        const matchingEvents = history.filter(event => {
+            // State match
+            const stateMatch = event.packageState === pair.state;
+
+            // Operation match
+            const operationMatch = Array.isArray(event.operation) ?
+                event.operation.includes(pair.operation) :
+                event.operation === pair.operation;
+
+            // ✅ NUOVO: Reason code match (se specificato)
+            let reasonCodeMatch = true;
+            if (pair.reasonCode) {
+                const eventReasonCode = event.reasonCode;
+                reasonCodeMatch = eventReasonCode &&
+                    eventReasonCode.toLowerCase().includes(pair.reasonCode.toLowerCase());
+
+                debugLog(`[REASON CODE] Checking "${eventReasonCode}" contains "${pair.reasonCode}": ${reasonCodeMatch}`);
+            }
+
+            // Destination match (esistente)
+            let destinationMatch = true;
+            if (pair.destination) {
+                destinationMatch = event.destination &&
+                    event.destination.toLowerCase().includes(pair.destination.toLowerCase());
+            } else if (pair.alias === 'In Transit - To DS') {
+                destinationMatch = !event.destination ||
+                    !event.destination.toLowerCase().includes('customer_address');
+            }
+
+            // Date match (esistente)
+            let dateMatch = true;
+            if (dateFilterEnabled && (fromDate || toDate)) {
+                const eventDate = new Date(event.stateTime);
+                if (fromDate && eventDate < fromDate) dateMatch = false;
+                if (toDate && eventDate > toDate) dateMatch = false;
+            }
+
+            const finalMatch = stateMatch && operationMatch && reasonCodeMatch && destinationMatch && dateMatch;
+
+            // ✅ LOG DETTAGLIATO per debug
+            if (pair.reasonCode) {
+                debugLog(`[FILTER] Event ${event.stateTime}: state=${stateMatch}, op=${operationMatch}, reason=${reasonCodeMatch}, dest=${destinationMatch}, date=${dateMatch} -> ${finalMatch}`);
+            }
+
+            return finalMatch;
+        });
+
+        const mostRecent = matchingEvents.sort((a, b) =>
+            new Date(b.stateTime) - new Date(a.stateTime))[0];
+
+        if (mostRecent) {
+            results.push({
+                state: pair,
+                event: mostRecent
+            });
+        }
+    }
+
+    return results;
+}
+
+
+async function processTracking(trackingId) {
+    try {
+        const [historyData, packageData] = await makeRequest(trackingId);
+        debugLog(`Processing tracking ${trackingId}`);
+
+        if (historyData.error) {
+            // Gestione differenziata degli errori
+            if (historyData.error) {
+                // Solo "No System data" per tutti gli errori (inclusi NOT_FOUND)
+                return [{
+                    tracking: trackingId,
+                    stateTime: '',
+                    state: 'No System data',
+                    source: '',
+                    eventProcessedBy: '',
+                    sortZone: '',
+                    operation: '',
+                    cycle: '',
+                    daysOOR: 0,
+                    additionalInfo: '',
+                    indicators: []
+                }];
+            } else {
+                return [{
+                    tracking: trackingId,
+                    stateTime: '',
+                    state: 'Error',
+                    source: '',
+                    eventProcessedBy: '',
+                    sortZone: '',
+                    operation: '',
+                    cycle: '',
+                    daysOOR: 0,
+                    additionalInfo: historyData.message,
+                    indicators: [],
+                    displayStyle: 'error'
+                }];
+            }
+        }
+
+        const selectedStates = Array.from(document.getElementById('stateSelector').selectedOptions)
+            .map(option => option.value);
+
+        if (selectedStates.length === 0) {
+            return [{
+                tracking: trackingId,
+                stateTime: '',
+                state: 'Please select at least one state',
+                source: '',
+                eventProcessedBy: '',
+                sortZone: '',
+                operation: '',
+                cycle: '',
+                daysOOR: 0,
+                additionalInfo: '',
+                indicators: []
+            }];
+        }
+
+        const targetEvents = findMostRecentStates(historyData.packageHistory, selectedStates);
+
+        // ========================================
+        // GESTIONE INDICATORI - SEZIONE DEDICATA
+        // ========================================
+
+        const indicators = [];
+
+        // 1. LINKED PACKAGE - Controllo pacchi collegati (Giallo #ffcc00)
+        const hasLinkedTracking = packageData?.packageDetail?.packageData?.linkedTrackingIds?.length > 0;
+        if (hasLinkedTracking) {
+            indicators.push({
+                type: 'linked-package',
+                label: 'TrId Linked',
+                color: '#ffcc00',
+                description: 'Package has linked tracking IDs'
+            });
+        }
+
+        // 2. SCRUB BAG - Controllo evento Scrub Bag nella colonna Operation (Arancione #ff9800)
+        const hasScrubBag = historyData.packageHistory?.some(event => {
+            // Controlla sia nell'operation che in altre possibili proprietà
+            const operation = Array.isArray(event.operation) ?
+                event.operation.join(' ') :
+                (event.operation || '');
+
+            // Controlla anche altre proprietà che potrebbero contenere "Scrub Bag"
+            const source = event.source || '';
+            const additionalInfo = [
+                event.reasonCode,
+                event.manifestRouteCode,
+                event.routeCode
+            ].filter(Boolean).join(' ');
+
+            // Cerca "Scrub Bag" (case insensitive) in tutte le proprietà rilevanti
+            const searchText = [operation, source, additionalInfo].join(' ').toLowerCase();
+            debugLog(`Checking for Scrub Bag in tracking ${trackingId}: "${searchText}"`);
+
+            return searchText.includes('scrub bag') || searchText.includes('scrub_bag') || searchText.includes('scrubag');
+        });
+
+        if (hasScrubBag) {
+            debugLog(`Found Scrub Bag in tracking ${trackingId}`);
+            indicators.push({
+                type: 'scrub-bag',
+                label: 'Scrub Bag',
+                color: '#ff9800',
+                description: 'Package has Scrub Bag operation'
+            });
+        }
+
+        // ✅ 3. REDIRECTED - Controllo evento Redirected nella colonna Operation (Viola #9C27B0)
+        const hasRedirected = historyData.packageHistory?.some(event => {
+            // Controlla sia nell'operation che in altre possibili proprietà
+            const operation = Array.isArray(event.operation) ?
+                event.operation.join(' ') :
+                (event.operation || '');
+
+            // Controlla anche altre proprietà che potrebbero contenere "Redirected"
+            const source = event.source || '';
+            const additionalInfo = [
+                event.reasonCode,
+                event.manifestRouteCode,
+                event.routeCode
+            ].filter(Boolean).join(' ');
+
+            // Cerca "Redirected" (case insensitive) in tutte le proprietà rilevanti
+            const searchText = [operation, source, additionalInfo].join(' ').toLowerCase();
+            debugLog(`Checking for Redirected in tracking ${trackingId}: "${searchText}"`);
+
+            return searchText.includes('redirected') || searchText.includes('redirect');
+        });
+
+        if (hasRedirected) {
+            debugLog(`Found Redirected in tracking ${trackingId}`);
+            indicators.push({
+                type: 'redirected',
+                label: 'Redirected',
+                color: '#9C27B0',
+                description: 'Package has been redirected'
+            });
+        }
+
+        // 4. HIGH VALUE - Verde scuro #228B22
+        const orderAmount = packageData?.packageDetail?.packageData?.orderInfo?.orderAmount;
+        const orderCurrency = packageData?.packageDetail?.packageData?.orderInfo?.orderCurrency;
+
+        if (orderAmount && orderCurrency) {
+            const threshold = orderCurrency === 'INR' ? 10000 :
+                orderCurrency === 'JPY' ? 20000 :
+                orderCurrency === 'BRL' ? 500 :
+                orderCurrency === 'EUR' ? 100 : 100;
+
+            if (orderAmount >= threshold) {
+                const roundedAmount = Math.round(orderAmount * 100) / 100; // Arrotonda a 2 decimali
+                debugLog(`Found High Value package: ${roundedAmount} ${orderCurrency} (threshold: ${threshold})`);
+
+                indicators.push({
+                    type: 'high-value',
+                    label: 'High Value',
+                    color: '#228B22',
+                    description: `High value package: ${roundedAmount} ${orderCurrency}`
+                });
+            }
+        }
+
+        // 5. OTP - Cerca solo ATTENDED esatto (non tutto quello che contiene attend)
+        const packageDataNested = packageData?.packageDetail?.packageData;
+        console.log(`[OTP DEBUG] Searching for ATTENDED/UNATTENDED in ${trackingId}:`);
+
+        // Funzione per cercare ATTENDED/UNATTENDED in modo preciso
+        const findAttendedStatus = (obj, path = '') => {
+            const results = [];
+            if (!obj || typeof obj !== 'object') return results;
+
+            for (const [key, value] of Object.entries(obj)) {
+                const currentPath = path ? `${path}.${key}` : key;
+
+                // SOLO se il valore è esattamente ATTENDED o UNATTENDED
+                if (typeof value === 'string') {
+                    const upperValue = value.toUpperCase().trim();
+                    if (upperValue === 'ATTENDED' || upperValue === 'UNATTENDED') {
+                        results.push({ path: currentPath, key, value: upperValue });
+                        console.log(`[ATTENDED EXACT] Found: ${currentPath} = ${upperValue}`);
+                    }
+                }
+
+                // Ricorsivo solo per oggetti (max 2 livelli)
+                if (typeof value === 'object' && value !== null &&
+                    !Array.isArray(value) && path.split('.').length < 2) {
+                    results.push(...findAttendedStatus(value, currentPath));
+                }
+            }
+            return results;
+        };
+
+        // Cerca ATTENDED/UNATTENDED
+        const attendedResults = findAttendedStatus(packageDataNested);
+        console.log('[OTP DEBUG] Found ATTENDED/UNATTENDED fields:', attendedResults);
+
+        // Determina OTP: solo se trova esattamente "ATTENDED"
+        const attendedField = attendedResults.find(result => result.value === 'ATTENDED');
+        const hasOtp = !!attendedField;
+
+        if (hasOtp) {
+            console.log(`[OTP DEBUG] ✅ ATTENDED found at: ${attendedField.path}`);
+            debugLog(`Found OTP package (ATTENDED): ${trackingId}`);
+            indicators.push({
+                type: 'otp',
+                label: 'OTP',
+                color: '#DC143C',
+                description: `Attended delivery required (OTP)`
+            });
+        } else {
+            console.log(`[OTP DEBUG] ❌ No ATTENDED found for ${trackingId}`);
+            // Mostra tutti i risultati per debug
+            if (attendedResults.length > 0) {
+                console.log('[OTP DEBUG] Found other values:', attendedResults.map(r => `${r.path}=${r.value}`));
+            }
+        }
+
+        // ✅ 6. MNR - Manifested Not Received (LOGICA FINALE CORRETTA)
+        // Stati consentiti per MNR (sequenza progressiva + stati speciali)
+        const mnrAllowedStates = [
+            { state: 'MANIFESTED', operation: 'PACKAGE_INJECTION' },
+            { state: 'ARRIVED', operation: 'PACKAGE_STATE_UPDATE' },
+            { state: 'RECEIVED', operation: 'INBOUND_RECEIVE' },
+            // Stati speciali che può avere un MNR
+            { state: 'HELD', operation: 'PACKAGE_STATE_UPDATE' },
+            { state: 'MARKED_AS_LOST', operation: 'PACKAGE_STATE_UPDATE' },
+            { state: 'MARKED_AS_MISSING', operation: 'PACKAGE_STATE_UPDATE' }
+        ];
+
+        // Stati che NON deve avere per essere MNR (tutti gli altri stati di progressione)
+        const nonMnrStates = [
+            { state: 'DELIVERY_FAILED', operation: 'PACKAGE_STATE_UPDATE' },
+            { state: 'DELIVERED', operation: 'PACKAGE_STATE_UPDATE' },
+            { state: 'INDUCTED', operation: 'PACKAGE_STATE_UPDATE' },
+            { state: 'IN_TRANSIT', operation: 'PACKAGE_STATE_UPDATE' }, // Qualsiasi IN_TRANSIT
+            { state: 'MARKED_FOR_REPROCESS', operation: 'PACKAGE_STATE_UPDATE' },
+            { state: 'MARKED_FOR_PROBLEM', operation: 'PACKAGE_STATE_UPDATE' },
+            { state: 'PICKED', operation: 'PACKAGE_STATE_UPDATE' },
+            { state: 'RECEIVED', operation: 'ASSOCIATE_DEBRIEF' }, // L'altro tipo di RECEIVED
+            { state: 'STAGED', operation: 'PACKAGE_STATE_UPDATE' },
+            { state: 'STOWED', operation: 'PACKAGE_STATE_UPDATE' }
+        ];
+
+        // Controlla gli stati della sequenza MNR principale
+        const hasManifested = historyData.packageHistory?.some(event =>
+            event.packageState === 'MANIFESTED' &&
+            (Array.isArray(event.operation) ?
+                event.operation.includes('PACKAGE_INJECTION') :
+                event.operation === 'PACKAGE_INJECTION')
+        );
+
+        const hasArrived = historyData.packageHistory?.some(event =>
+            event.packageState === 'ARRIVED' &&
+            (Array.isArray(event.operation) ?
+                event.operation.includes('PACKAGE_STATE_UPDATE') :
+                event.operation === 'PACKAGE_STATE_UPDATE')
+        );
+
+        const hasReceivedInbound = historyData.packageHistory?.some(event =>
+            event.packageState === 'RECEIVED' &&
+            (Array.isArray(event.operation) ?
+                event.operation.includes('INBOUND_RECEIVE') :
+                event.operation === 'INBOUND_RECEIVE')
+        );
+
+        // Controlla stati speciali MNR
+        const hasHeld = historyData.packageHistory?.some(event =>
+            event.packageState === 'HELD' &&
+            (Array.isArray(event.operation) ?
+                event.operation.includes('PACKAGE_STATE_UPDATE') :
+                event.operation === 'PACKAGE_STATE_UPDATE')
+        );
+
+        const hasMarkedAsLost = historyData.packageHistory?.some(event =>
+            event.packageState === 'MARKED_AS_LOST' &&
+            (Array.isArray(event.operation) ?
+                event.operation.includes('PACKAGE_STATE_UPDATE') :
+                event.operation === 'PACKAGE_STATE_UPDATE')
+        );
+
+        const hasMarkedAsMissing = historyData.packageHistory?.some(event =>
+            event.packageState === 'MARKED_AS_MISSING' &&
+            (Array.isArray(event.operation) ?
+                event.operation.includes('PACKAGE_STATE_UPDATE') :
+                event.operation === 'PACKAGE_STATE_UPDATE')
+        );
+
+        // Controlla che NON abbia stati di progressione non consentiti per MNR
+        const hasNonMnrState = historyData.packageHistory?.some(event => {
+            return nonMnrStates.some(nonMnrState => {
+                const stateMatch = event.packageState === nonMnrState.state;
+                const operationMatch = Array.isArray(event.operation) ?
+                    event.operation.includes(nonMnrState.operation) :
+                    event.operation === nonMnrState.operation;
+
+                return stateMatch && operationMatch;
+            });
+        });
+
+        // Logica MNR: DEVE avere MANIFESTED e NON deve avere stati non consentiti
+        let isMnr = false;
+
+        if (hasManifested && !hasNonMnrState) {
+            isMnr = true;
+
+            // Log per debug delle varie combinazioni
+            const states = [];
+            if (hasManifested) states.push('MANIFESTED');
+            if (hasArrived) states.push('ARRIVED');
+            if (hasReceivedInbound) states.push('RECEIVED-INBOUND');
+            if (hasHeld) states.push('HELD');
+            if (hasMarkedAsLost) states.push('MARKED_AS_LOST');
+            if (hasMarkedAsMissing) states.push('MARKED_AS_MISSING');
+
+            debugLog(`Found MNR package: ${trackingId} - States: ${states.join(', ')}`);
+        }
+
+        if (isMnr) {
+            indicators.push({
+                type: 'mnr',
+                label: 'MNR',
+                color: '#FF5722',
+                description: 'Manifested but not received'
+            });
+        } else {
+            debugLog(`Package ${trackingId} - Not MNR: hasManifested=${hasManifested}, hasNonMnrState=${hasNonMnrState}`);
+        }
+
+       // ✅ 7. ROUTE MANUAL ASSIGNMENT - Controllo sequenza manuale + riassegnazione automatica
+const hasRouteManualAssignment = (() => {
+    if (!historyData.packageHistory || !Array.isArray(historyData.packageHistory)) {
+        return false;
+    }
+
+    // Funzione per ottenere la data (YYYY-MM-DD) da un timestamp
+    const getDateString = (timestamp) => {
+        if (!timestamp) return null;
+        return new Date(timestamp).toISOString().split('T')[0];
+    };
+
+    // Raggruppa eventi per data
+    const eventsByDate = {};
+    historyData.packageHistory.forEach(event => {
+        const dateString = getDateString(event.stateTime);
+        if (dateString) {
+            if (!eventsByDate[dateString]) {
+                eventsByDate[dateString] = [];
+            }
+            eventsByDate[dateString].push(event);
+        }
+    });
+
+    debugLog(`[ROUTE MANUAL] Checking ${Object.keys(eventsByDate).length} different dates for ${trackingId}`);
+
+    // Controlla ogni data
+    for (const [dateString, eventsInDate] of Object.entries(eventsByDate)) {
+        debugLog(`[ROUTE MANUAL] Checking date ${dateString} with ${eventsInDate.length} events`);
+
+        // Ordina eventi per timestamp
+        const sortedEvents = eventsInDate.sort((a, b) => new Date(a.stateTime) - new Date(b.stateTime));
+
+        // Cerca la sequenza completa (1, 2, 3)
+        let foundHeld = false;
+        let foundRouteAssignment = false;
+        let foundDriverAssignment = false;
+        let sequenceComplete = false;
+
+        for (const event of sortedEvents) {
+            const operation = Array.isArray(event.operation) ? event.operation.join(' ') : (event.operation || '');
+            const reasonCode = (event.reasonCode || '').toLowerCase();
+            const cycle = (event.cycle || '').toLowerCase();
+            const eventProcessedBy = event.eventProcessedBy || event.scanAssociate || '';
+
+            debugLog(`[ROUTE MANUAL] Event: state=${event.packageState}, operation="${operation}", reasonCode="${reasonCode}", cycle="${cycle}", processedBy="${eventProcessedBy}"`);
+
+            // Step 1: HELD con reasonCode 'wrong_cycle_induct' e cycle 'hv_a'
+            if (!foundHeld &&
+                event.packageState === 'HELD' &&
+                operation.toLowerCase().includes('package_state_update') &&
+                reasonCode.includes('wrong_cycle_induct') &&
+                cycle.includes('hv_a')) {
+
+                foundHeld = true;
+                debugLog(`[ROUTE MANUAL] ✅ Found HELD step for ${trackingId} at ${event.stateTime}`);
+                continue;
+            }
+
+            // Step 2: ROUTE_ASSIGNMENT da RPMRoutePlanner (dopo HELD)
+            if (foundHeld && !foundRouteAssignment &&
+                operation.toLowerCase().includes('route_assignment') &&
+                eventProcessedBy.toLowerCase().includes('rpmrouteplanner')) {
+
+                foundRouteAssignment = true;
+                debugLog(`[ROUTE MANUAL] ✅ Found ROUTE_ASSIGNMENT step for ${trackingId} at ${event.stateTime}`);
+                continue;
+            }
+
+            // Step 3: DRIVER_ASSIGNMENT da P2PTransportRequestAssignmentService (dopo i primi due)
+            if (foundHeld && foundRouteAssignment && !foundDriverAssignment &&
+                operation.toLowerCase().includes('driver_assignment') &&
+                eventProcessedBy.toLowerCase().includes('p2ptransportrequestassignmentservice')) {
+
+                foundDriverAssignment = true;
+                sequenceComplete = true;
+                debugLog(`[ROUTE MANUAL] ✅ Found complete sequence for ${trackingId} at ${event.stateTime}`);
+                break;
+            }
+        }
+
+        // Se abbiamo trovato la sequenza completa, ora cerchiamo il solo DRIVER_ASSIGNMENT successivo
+        if (sequenceComplete) {
+            debugLog(`[ROUTE MANUAL] Sequence complete, looking for standalone DRIVER_ASSIGNMENT for ${trackingId}`);
+
+            // Trova il timestamp dell'ultimo evento della sequenza
+            const lastSequenceEvent = sortedEvents.find(e => {
+                const op = Array.isArray(e.operation) ? e.operation.join(' ') : (e.operation || '');
+                const epb = e.eventProcessedBy || e.scanAssociate || '';
+                return foundDriverAssignment &&
+                       op.toLowerCase().includes('driver_assignment') &&
+                       epb.toLowerCase().includes('p2ptransportrequestassignmentservice');
+            });
+
+            if (!lastSequenceEvent) {
+                debugLog(`[ROUTE MANUAL] ❌ Could not find last sequence event for ${trackingId}`);
+                continue;
+            }
+
+            const lastSequenceTime = new Date(lastSequenceEvent.stateTime);
+            debugLog(`[ROUTE MANUAL] Last sequence event at: ${lastSequenceTime.toISOString()}`);
+
+            // Cerca eventi successivi nella stessa data e date successive
+            let checkEvents = [];
+
+            // Eventi nella stessa data dopo la sequenza
+            checkEvents.push(...sortedEvents.filter(e => new Date(e.stateTime) > lastSequenceTime));
+
+            // Eventi delle date successive
+            const allDates = Object.keys(eventsByDate).sort();
+            const currentDateIndex = allDates.indexOf(dateString);
+
+            for (let i = currentDateIndex + 1; i < allDates.length; i++) {
+                checkEvents.push(...eventsByDate[allDates[i]]);
+            }
+
+            // Ordina tutti gli eventi da controllare
+            checkEvents.sort((a, b) => new Date(a.stateTime) - new Date(b.stateTime));
+
+            debugLog(`[ROUTE MANUAL] Checking ${checkEvents.length} events after sequence completion`);
+
+            // Cerca il solo DRIVER_ASSIGNMENT
+            for (const event of checkEvents) {
+                const operation = Array.isArray(event.operation) ? event.operation.join(' ') : (event.operation || '');
+                const eventProcessedBy = event.eventProcessedBy || event.scanAssociate || '';
+
+                debugLog(`[ROUTE MANUAL] Checking post-sequence event: operation="${operation}", processedBy="${eventProcessedBy}"`);
+
+                if (operation.toLowerCase().includes('driver_assignment') &&
+                    eventProcessedBy.toLowerCase().includes('p2ptransportrequestassignmentservice')) {
+
+                    debugLog(`[ROUTE MANUAL] ✅ Found standalone DRIVER_ASSIGNMENT for ${trackingId} at ${event.stateTime}`);
+                    return true;
+                }
+            }
+
+            debugLog(`[ROUTE MANUAL] ❌ No standalone DRIVER_ASSIGNMENT found after sequence for ${trackingId}`);
+        } else {
+            debugLog(`[ROUTE MANUAL] ❌ Sequence not complete for ${trackingId} on ${dateString}: held=${foundHeld}, route=${foundRouteAssignment}, driver=${foundDriverAssignment}`);
+        }
+    }
+
+    debugLog(`[ROUTE MANUAL] ❌ Pattern not found for ${trackingId}`);
+    return false;
+})();
+
+if (hasRouteManualAssignment) {
+    debugLog(`Found Route Manual Assignment package: ${trackingId}`);
+    indicators.push({
+        type: 'route-manual',
+        label: 'Route Manual',
+        color: '#8B4513',
+        description: 'Package had manual route assignment'
+    });
+}
+
+
+        // ========================================
+        // FINE GESTIONE INDICATORI
+        // ========================================
+
+        if (targetEvents.length > 0) {
+            return targetEvents.map(({event}) => ({
+                tracking: trackingId,
+                stateTime: formatDate(event.stateTime),
+                state: event.packageState,
+                source: event.source || '',
+                eventProcessedBy: event.scanAssociate || event.eventProcessedBy || '',
+                sortZone: event.sortZone || '',
+                operation: getOperationAlias(event.operation), // ✅ USA ALIAS
+                cycle: event.cycle || '',
+                daysOOR: calculateDaysOOR(historyData.packageHistory),
+                additionalInfo: [
+                    event.reasonCode,
+                    event.manifestRouteCode,
+                    event.routeCode
+                ].filter(Boolean).join(' | '),
+                indicators: indicators
+            }));
+        } else {
+            return [{
+                tracking: trackingId,
+                stateTime: '',
+                state: 'States not found',
+                source: '',
+                eventProcessedBy: '',
+                sortZone: '',
+                operation: '',
+                cycle: '',
+                daysOOR: calculateDaysOOR(historyData.packageHistory),
+                additionalInfo: '',
+                indicators: indicators
+            }];
+        }
+
+    } catch (error) {
+        debugLog(`Error processing ${trackingId}: ${error.message}`);
+        return [{
+            tracking: trackingId,
+            stateTime: '',
+            state: 'Error',
+            source: '',
+            eventProcessedBy: '',
+            sortZone: '',
+            operation: '',
+            cycle: '',
+            daysOOR: 0,
+            additionalInfo: error.message,
+            indicators: [],
+            displayStyle: 'error'
+        }];
+    }
+}
+
+console.log('[SCC] FINE SEZIONE 10: Data processing');
+
+
+// ================================================================================================
+// SEZIONE 11: MAIN PROCESSING FUNCTION
+// ================================================================================================
+
+console.log('[SCC] INIZIO SEZIONE 11: Main processing function');
+
+window.processTrackings = async function(trackings) {
+    // Create AbortController per interrompere le richieste
+    window.abortController = new AbortController();
+    const signal = window.abortController.signal;
+
+    // ✅ USA CONFIGURAZIONE DINAMICA
+    let BATCH_SIZE = CONFIG.BATCH_SIZE; // ✅ Può essere modificato dinamicamente
+    let BATCH_DELAY = CONFIG.BATCH_DELAY; // ✅ Può essere modificato dinamicamente
+    const REQUEST_TIMEOUT = CONFIG.REQUEST_TIMEOUT;
+    const USE_JITTER = CONFIG.USE_JITTER;
+    const USE_ADAPTIVE = CONFIG.USE_ADAPTIVE;
+
+    // ✅ VARIABILI PER ADAPTIVE BACKOFF
+    let adaptiveDelayMultiplier = 1.0;
+    let rateLimitDetected = false;
+    const batchTimes = []; // Track dei tempi di risposta
+
+    debugLog(`[PERFORMANCE] Level ${CONFIG.PERFORMANCE_LEVEL}: ${CONFIG.PERFORMANCE_DESCRIPTION}`);
+    debugLog(`[PERFORMANCE] Initial: Batch=${BATCH_SIZE}, Delay=${BATCH_DELAY}ms, Jitter=${USE_JITTER ? 'ON' : 'OFF'}, Adaptive=${USE_ADAPTIVE}`);
+
+    // ✅ VARIABILI GLOBALI PER TRACKING PROGRESS (FUORI DAL TRY)
+    let completedCount = 0;
+    let totalCount = 0;
+    let validTrackings = [];
+
+    // Add timer
+    const startTime = Date.now();
+    const timerInterval = setInterval(() => {
+        // Controlla se è stato cancellato
+        if (signal.aborted) {
+            clearInterval(timerInterval);
+            return;
+        }
+
+        const elapsedTime = Math.floor((Date.now() - startTime) / 1000);
+        const minutes = Math.floor(elapsedTime / 60);
+        const seconds = elapsedTime % 60;
+        const timerText = document.getElementById('timerText');
+        if (timerText) {
+            timerText.textContent = `Time: ${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+        }
+    }, 1000);
+
+    try {
+        // Wait for all required elements
+        const progressContainer = await waitForElement('#progressContainer');
+        const progressBar = await waitForElement('#progressBar');
+        const progressText = await waitForElement('#progressText');
+        const exportButton = await waitForElement('#exportButton');
+        const table = await waitForElement('#resultsTable');
+        const tbody = table.querySelector('tbody');
+
+        if (!tbody) {
+            throw new Error('Table body not found');
+        }
+
+        // Hide export button at start of search
+        exportButton.style.display = 'none';
+        progressContainer.style.display = 'block';
+        tbody.innerHTML = '';
+        table.style.display = 'table';
+
+        // Hide indicator summary at start
+        const summaryDiv = document.getElementById('indicatorSummary');
+        if (summaryDiv) summaryDiv.style.display = 'none';
+
+        // ✅ EXTRACT E DEDUPLICATE TRACKING NUMBERS (ottimizzato)
+        validTrackings = trackings
+            .reduce((acc, line) => {
+                const foundTrackings = extractTrackingNumbers(line);
+                return [...acc, ...foundTrackings];
+            }, [])
+            .filter((tracking, index, self) => self.indexOf(tracking) === index);
+
+        // ✅ IMPOSTA TOTAL COUNT QUI
+        totalCount = validTrackings.length;
+        debugLog(`[BATCH] Found ${totalCount} unique tracking numbers`);
+
+        if (totalCount === 0) {
+            throw new Error('No valid tracking numbers found');
+        }
+
+        // ✅ PROCESSING PARALLELO CON ADAPTIVE BACKOFF
+        let batchNumber = 0;
+        let totalBatches = Math.ceil(validTrackings.length / BATCH_SIZE);
+
+        // ✅ DIVIDE IN BATCH E PROCESSA CON SISTEMA ADATTIVO
+        for (let i = 0; i < validTrackings.length; i += BATCH_SIZE) {
+            if (signal.aborted) {
+                debugLog('[BATCH] Processing cancelled by user');
+                break;
+            }
+
+            batchNumber++;
+            const batch = validTrackings.slice(i, i + BATCH_SIZE);
+
+            // ✅ TIMESTAMP PER MISURARE PERFORMANCE
+            const batchStartTime = Date.now();
+            debugLog(`[BATCH ${batchNumber}/${totalBatches}] Processing ${batch.length} tracking(s): ${batch.join(', ')}`);
+
+            // ✅ ADAPTIVE: Mostra stato rate limiting se rilevato
+            if (rateLimitDetected) {
+                debugLog(`[ADAPTIVE] ⚠️ Rate limiting detected - Using: Batch=${BATCH_SIZE}, Delay=${Math.round(BATCH_DELAY * adaptiveDelayMultiplier)}ms`);
+            }
+
+            // ✅ PROCESS BATCH IN PARALLEL
+            const batchPromises = batch.map(async (tracking) => {
+                try {
+                    if (signal.aborted) {
+                        throw new Error('Cancelled by user');
+                    }
+
+                    const results = await processTracking(tracking);
+                    return { tracking, results, success: true };
+                } catch (error) {
+                    debugLog(`[BATCH ERROR] ${tracking}: ${error.message}`);
+                    return {
+                        tracking,
+                        results: [{
+                            tracking,
+                            stateTime: '',
+                            state: error.message.includes('Cancelled') ? 'Cancelled' : 'Error',
+                            source: '',
+                            eventProcessedBy: '',
+                            sortZone: '',
+                            operation: '',
+                            cycle: '',
+                            daysOOR: 0,
+                            additionalInfo: error.message,
+                            indicators: [],
+                            displayStyle: 'error'
+                        }],
+                        success: false
+                    };
+                }
+            });
+
+            // ✅ WAIT FOR ALL PROMISES IN BATCH
+            let batchResults;
+            try {
+                const batchTimeout = new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('Batch timeout')), REQUEST_TIMEOUT * 2)
+                );
+
+                batchResults = await Promise.race([
+                    Promise.allSettled(batchPromises),
+                    batchTimeout
+                ]);
+            } catch (error) {
+                debugLog(`[BATCH TIMEOUT] Batch ${batchNumber} timed out, continuing...`);
+                batchResults = batch.map(tracking => ({
+                    status: 'fulfilled',
+                    value: {
+                        tracking,
+                        results: [{
+                            tracking,
+                            stateTime: '',
+                            state: 'Timeout',
+                            source: '',
+                            eventProcessedBy: '',
+                            sortZone: '',
+                            operation: '',
+                            cycle: '',
+                            daysOOR: 0,
+                            additionalInfo: 'Batch processing timeout',
+                            indicators: []
+                        }],
+                        success: false
+                    }
+                }));
+            }
+
+            // ✅ CALCOLA TEMPO DI RISPOSTA DEL BATCH
+            const batchEndTime = Date.now();
+            const batchDuration = batchEndTime - batchStartTime;
+            batchTimes.push(batchDuration);
+
+            // ✅ ADAPTIVE BACKOFF: Rileva rate limiting
+            if (USE_ADAPTIVE && batchDuration > CONFIG.ADAPTIVE_THRESHOLD) {
+                if (!rateLimitDetected) {
+                    rateLimitDetected = true;
+                    debugLog(`[ADAPTIVE] 🚨 Rate limiting detected! Batch took ${batchDuration}ms (threshold: ${CONFIG.ADAPTIVE_THRESHOLD}ms)`);
+                }
+
+                // Aumenta delay e riduci batch size se necessario
+                adaptiveDelayMultiplier = Math.min(
+                    adaptiveDelayMultiplier * CONFIG.ADAPTIVE_BACKOFF_MULTIPLIER,
+                    CONFIG.ADAPTIVE_MAX_DELAY / BATCH_DELAY
+                );
+
+                // ✅ RIDUCI BATCH SIZE se rate limiting persiste
+                if (adaptiveDelayMultiplier > 2.0 && BATCH_SIZE > 1) {
+                    BATCH_SIZE = Math.max(1, BATCH_SIZE - 1);
+                    totalBatches = Math.ceil((validTrackings.length - i - batch.length) / BATCH_SIZE) + batchNumber;
+                    debugLog(`[ADAPTIVE] 📉 Reducing batch size to ${BATCH_SIZE} due to persistent rate limiting`);
+                }
+            } else if (rateLimitDetected && batchDuration < CONFIG.ADAPTIVE_THRESHOLD * 0.7) {
+                // ✅ RECOVERY: Rate limiting sembra essere finito
+                adaptiveDelayMultiplier = Math.max(1.0, adaptiveDelayMultiplier * 0.8);
+                if (adaptiveDelayMultiplier <= 1.1) {
+                    rateLimitDetected = false;
+                    debugLog(`[ADAPTIVE] ✅ Rate limiting seems resolved - returning to normal operation`);
+                }
+            }
+
+            // ✅ UPDATE UI PER OGNI RISULTATO DEL BATCH
+            batchResults.forEach((promiseResult) => {
+                if (signal.aborted) return;
+
+                completedCount++;
+                const progress = Math.round((completedCount / totalCount) * 100);
+
+                // ✅ UPDATE PROGRESS (ottimizzato)
+                progressBar.style.width = `${progress}%`;
+                progressText.textContent = `${progress}%`;
+                setToggleButtonState('searching', progress);
+
+                if (promiseResult.status === 'fulfilled' && promiseResult.value) {
+                    const { results } = promiseResult.value;
+
+                    // ✅ BATCH DOM UPDATE (ottimizzato)
+                    const fragment = document.createDocumentFragment();
+                    results.forEach(result => {
+                        if (signal.aborted) return;
+
+                        // ✅ USA FUNZIONE OTTIMIZZATA PER CREARE RIGHE
+                        const row = createResultRow(result);
+                        fragment.appendChild(row);
+                    });
+
+                    // ✅ SINGLE DOM UPDATE PER BATCH
+                    if (!signal.aborted && fragment.children.length > 0) {
+                        tbody.appendChild(fragment);
+                    }
+                } else {
+                    debugLog(`[BATCH] Promise rejected for batch item: ${promiseResult.reason}`);
+                }
+            });
+
+            debugLog(`[BATCH ${batchNumber}] Completed in ${batchDuration}ms. Progress: ${Math.round((completedCount / totalCount) * 100)}%`);
+
+            // ✅ DELAY TRA BATCH CON JITTER E ADAPTIVE BACKOFF
+            if (i + BATCH_SIZE < validTrackings.length && !signal.aborted) {
+                let delay = BATCH_DELAY * adaptiveDelayMultiplier;
+
+                // ✅ AGGIUNGI JITTER RANDOMICO se abilitato
+                if (USE_JITTER) {
+                    const jitter = Math.floor(Math.random() * (CONFIG.JITTER_MAX - CONFIG.JITTER_MIN + 1)) + CONFIG.JITTER_MIN;
+                    delay += jitter;
+                }
+
+                // ✅ LIMITA DELAY MASSIMO
+                delay = Math.min(delay, CONFIG.ADAPTIVE_MAX_DELAY);
+
+                if (rateLimitDetected) {
+                    debugLog(`[BATCH] ⚠️ Waiting ${Math.round(delay)}ms (adaptive backoff x${adaptiveDelayMultiplier.toFixed(1)}) before next batch...`);
+                } else {
+                    debugLog(`[BATCH] Waiting ${Math.round(delay)}ms before next batch...`);
+                }
+
+                await new Promise(resolve => setTimeout(resolve, Math.round(delay)));
+            }
+        }
+
+        // ✅ COMPLETION HANDLING
+        progressContainer.style.display = 'none';
+
+        // ✅ PERFORMANCE SUMMARY
+        if (batchTimes.length > 0) {
+            const avgBatchTime = batchTimes.reduce((a, b) => a + b, 0) / batchTimes.length;
+            const maxBatchTime = Math.max(...batchTimes);
+            debugLog(`[PERFORMANCE] Avg batch time: ${Math.round(avgBatchTime)}ms, Max: ${Math.round(maxBatchTime)}ms`);
+            if (rateLimitDetected) {
+                debugLog(`[PERFORMANCE] ⚠️ Rate limiting was detected and handled adaptively`);
+            }
+        }
+
+        // ✅ SHOW RESULTS se non cancellato E ci sono risultati
+        if (!signal.aborted) {
+            const rowCount = tbody.children.length;
+            debugLog(`[COMPLETION] Processing finished. Total rows: ${rowCount}`);
+
+            if (rowCount > 0) {
+                exportButton.style.display = 'block';
+
+                // ✅ SETUP SORTING E SUMMARY (con piccolo delay per UI responsiva)
+                setTimeout(() => {
+                    if (!signal.aborted) {
+                        setupTableSorting();
+                        updateIndicatorSummary();
+                        setToggleButtonState('completed');
+                    }
+                }, 100);
+            } else {
+                debugLog('[COMPLETION] No results to display');
+                setToggleButtonState('idle');
+            }
+        } else {
+            debugLog('[COMPLETION] Processing was cancelled');
+            setToggleButtonState('idle');
+        }
+
+    } catch (error) {
+        // Se è un abort, non mostrare errore
+        if (signal.aborted) {
+            debugLog('[COMPLETION] Processing aborted successfully');
+            setToggleButtonState('idle');
+            return;
+        }
+
+        debugLog('[ERROR] Error in processing trackings:', error);
+        console.error('[ERROR] Full error:', error);
+
+        const progressContainer = document.getElementById('progressContainer');
+        if (progressContainer) {
+            progressContainer.style.display = 'none';
+        }
+
+        setToggleButtonState('idle');
+        alert('An error occurred while processing the trackings: ' + error.message);
+
+    } finally {
+        clearInterval(timerInterval);
+        window.abortController = null; // Cleanup
+
+        // ✅ PERFORMANCE STATS (ora le variabili sono sempre disponibili)
+        const endTime = Date.now();
+        const totalTime = Math.round((endTime - startTime) / 1000);
+        const minutes = Math.floor(totalTime / 60);
+        const seconds = totalTime % 60;
+
+        debugLog(`[PERFORMANCE] Total processing time: ${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`);
+        debugLog(`[PERFORMANCE] Processed ${completedCount} out of ${totalCount} trackings`);
+        debugLog(`[PERFORMANCE] Level ${CONFIG.PERFORMANCE_LEVEL}: ${CONFIG.PERFORMANCE_DESCRIPTION}`);
+
+        if (completedCount > 0) {
+            const avgTimePerTracking = totalTime / completedCount;
+            debugLog(`[PERFORMANCE] Average time per tracking: ${avgTimePerTracking.toFixed(2)} seconds`);
+        }
+    }
+};
+
+// ✅ FUNZIONI DI SUPPORTO INDICATOR SUMMARY
+
+function updateIndicatorSummary() {
+    const tbody = document.querySelector('#resultsTable tbody');
+    const summaryDiv = document.getElementById('indicatorSummary');
+    const filterButtonsDiv = document.getElementById('filterButtons');
+
+    if (!tbody || !summaryDiv) return;
+
+    const rows = tbody.querySelectorAll('tr');
+
+    // Raccogli tutti i tracking ID univoci e i loro indicatori
+    const uniqueTrackingIds = new Set();
+    const linkedTrackingIds = new Set();
+    const scrubBagTrackingIds = new Set();
+    const redirectedTrackingIds = new Set();
+    const highValueTrackingIds = new Set();
+    const otpTrackingIds = new Set();
+    const mnrTrackingIds = new Set();
+    const routeManualTrackingIds = new Set(); // ✅ NUOVO INDICATORE
+
+    rows.forEach(row => {
+        const trackingLink = row.querySelector('td:nth-child(2) a');
+        if (trackingLink) {
+            const trackingId = trackingLink.textContent.trim();
+            uniqueTrackingIds.add(trackingId);
+
+            if (row.dataset.hasLinked === 'true') linkedTrackingIds.add(trackingId);
+            if (row.dataset.hasScrubBag === 'true') scrubBagTrackingIds.add(trackingId);
+            if (row.dataset.hasRedirected === 'true') redirectedTrackingIds.add(trackingId);
+            if (row.dataset.hasHighValue === 'true') highValueTrackingIds.add(trackingId);
+            if (row.dataset.hasOtp === 'true') otpTrackingIds.add(trackingId);
+            if (row.dataset.hasMnr === 'true') mnrTrackingIds.add(trackingId);
+            if (row.dataset.hasRouteManual === 'true') routeManualTrackingIds.add(trackingId); // ✅ NUOVO
+        }
+    });
+
+    const totalUniqueTracking = uniqueTrackingIds.size;
+    const uniqueLinkedPackages = linkedTrackingIds.size;
+    const uniqueScrubBagPackages = scrubBagTrackingIds.size;
+    const uniqueRedirectedPackages = redirectedTrackingIds.size;
+    const uniqueHighValuePackages = highValueTrackingIds.size;
+    const uniqueOtpPackages = otpTrackingIds.size;
+    const uniqueMnrPackages = mnrTrackingIds.size;
+    const uniqueRouteManualPackages = routeManualTrackingIds.size; // ✅ NUOVO
+
+    // Mostra il summary
+    summaryDiv.style.display = 'block';
+
+    // ✅ TEMPLATE HTML OTTIMIZZATO CON NUOVO INDICATORE E TOGGLE SWITCH
+    let filterButtonsHTML = `
+    <div style="background: #f8f9fa; padding: 4px; border-radius: 8px; display: inline-flex; box-shadow: inset 0 2px 4px rgba(0,0,0,0.1); position: relative; border: 1px solid #e9ecef;">
+    <div class="toggle-option active" data-filter="all" style="padding: 12px 18px; border-radius: 5px; cursor: pointer; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); background: rgb(7, 115, 152); color: white; font-weight: 600; font-size: 13px; position: relative; z-index: 2; box-shadow: 0 2px 8px rgba(7, 115, 152, 0.3); display: flex; align-items: center; gap: 8px;">
+    <div style="width: 10px; height: 10px; background-color: rgba(255, 255, 255, 0.9); border-radius: 2px;"></div>
+    <span>Total: ${totalUniqueTracking}</span>
+    </div>`;
+
+    // ✅ AGGIUNGI FILTRI CON TOGGLE SWITCHES
+    const filterConfigs = [
+        { count: uniqueLinkedPackages, filter: 'linked', color: '#ffcc00', label: 'TrId Linked' },
+        { count: uniqueScrubBagPackages, filter: 'scrub-bag', color: '#ff9800', label: 'Scrub Bag' },
+        { count: uniqueRedirectedPackages, filter: 'redirected', color: '#9C27B0', label: 'Redirected' },
+        { count: uniqueHighValuePackages, filter: 'high-value', color: '#228B22', label: 'High Value' },
+        { count: uniqueOtpPackages, filter: 'otp', color: '#DC143C', label: 'OTP' },
+        { count: uniqueMnrPackages, filter: 'mnr', color: '#FF5722', label: 'MNR' },
+        { count: uniqueRouteManualPackages, filter: 'route-manual', color: '#8B4513', label: 'Route Manual Assignment' } // ✅ NUOVO
+    ];
+
+    filterConfigs.forEach(config => {
+        if (config.count > 0) {
+            filterButtonsHTML += `
+            <div class="filter-group" style="display: flex; align-items: center; gap: 4px;">
+                <div class="toggle-option" data-filter="${config.filter}" style="padding: 12px 18px; border-radius: 5px; cursor: pointer; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); background: transparent; color: #666; font-weight: 600; font-size: 13px; position: relative; z-index: 2; display: flex; align-items: center; gap: 8px;">
+                    <div style="width: 10px; height: 10px; background-color: ${config.color}; border-radius: 2px; opacity: 0.4;"></div>
+                    <span class="filter-text">${config.label}: ${config.count}</span>
+                </div>
+                <div class="toggle-switch disabled" data-target="${config.filter}" style="
+                    width: 24px;
+                    height: 24px;
+                    border-radius: 50%;
+                    background: #f5f5f5;
+                    cursor: not-allowed;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    font-size: 12px;
+                    transition: all 0.2s ease;
+                    user-select: none;
+                    opacity: 0.5;
+                    color: #ccc;
+                " title="Select a filter first to enable toggle">🔄</div>
+            </div>`;
+        }
+    });
+
+    filterButtonsHTML += '</div>';
+    filterButtonsDiv.innerHTML = filterButtonsHTML;
+
+    // Setup filter functionality
+    setupToggleIndicatorFilters();
+
+    debugLog(`[SUMMARY] Updated - Total: ${totalUniqueTracking}, Linked: ${uniqueLinkedPackages}, Scrub: ${uniqueScrubBagPackages}, Redirected: ${uniqueRedirectedPackages}, High Value: ${uniqueHighValuePackages}, OTP: ${uniqueOtpPackages}, MNR: ${uniqueMnrPackages}, Route Manual: ${uniqueRouteManualPackages}`);
+}
+
+function setupToggleIndicatorFilters() {
+    const toggleOptions = document.querySelectorAll('.toggle-option');
+    const toggleSwitches = document.querySelectorAll('.toggle-switch');
+
+    // ✅ GESTIONE CLICK SUI FILTRI (semplificata)
+    toggleOptions.forEach(option => {
+        option.addEventListener('click', () => {
+            const filterType = option.dataset.filter;
+
+            // ✅ RESET COMPLETO
+            resetAllFiltersAndSwitches();
+
+            // ✅ ATTIVA SOLO IL FILTRO SELEZIONATO
+            activateFilter(option, filterType);
+
+            // ✅ ABILITA IL TOGGLE SWITCH CORRISPONDENTE
+            enableToggleSwitchForFilter(filterType);
+
+            // ✅ APPLICA FILTRO (sempre normale la prima volta)
+            applyFilter(filterType, false);
+
+            debugLog(`[FILTER] Activated: ${filterType}`);
+        });
+
+        // Hover effects
+        option.addEventListener('mouseenter', () => {
+            if (!option.classList.contains('active')) {
+                option.style.background = 'rgba(0, 0, 0, 0.05)';
+                const square = option.querySelector('div');
+                square.style.opacity = '0.7';
+                square.style.transform = 'scale(1.1)';
+            }
+        });
+
+        option.addEventListener('mouseleave', () => {
+            if (!option.classList.contains('active')) {
+                option.style.background = 'transparent';
+                const square = option.querySelector('div');
+                square.style.opacity = '0.4';
+                square.style.transform = 'scale(1)';
+            }
+        });
+    });
+
+    // ✅ GESTIONE TOGGLE SWITCHES (semplificata)
+    toggleSwitches.forEach(toggleSwitch => {
+        toggleSwitch.addEventListener('click', (e) => {
+            e.stopPropagation();
+
+            // ✅ CONTROLLA SE È ABILITATO
+            if (toggleSwitch.classList.contains('disabled')) {
+                return; // Non fare nulla se disabilitato
+            }
+
+            const targetFilter = toggleSwitch.dataset.target;
+            const targetOption = document.querySelector(`[data-filter="${targetFilter}"]`);
+
+            if (!targetOption || !targetOption.classList.contains('active')) {
+                return; // Non fare nulla se il filtro non è attivo
+            }
+
+            // ✅ TOGGLE SEMPLICE TRA NORMALE E INVERSO
+            const isCurrentlyInverted = toggleSwitch.dataset.inverted === 'true';
+            const newInverted = !isCurrentlyInverted;
+
+            // ✅ AGGIORNA TOGGLE SWITCH
+            updateToggleSwitch(toggleSwitch, targetFilter, newInverted);
+
+            // ✅ APPLICA FILTRO CON NUOVO STATO
+            applyFilter(targetFilter, newInverted);
+
+            debugLog(`[TOGGLE] ${targetFilter} inverted: ${newInverted}`);
+        });
+
+        // Hover effects per toggle
+        toggleSwitch.addEventListener('mouseenter', () => {
+            if (!toggleSwitch.classList.contains('disabled')) {
+                if (toggleSwitch.dataset.inverted !== 'true') {
+                    toggleSwitch.style.background = '#d0d0d0';
+                }
+            }
+        });
+
+        toggleSwitch.addEventListener('mouseleave', () => {
+            if (!toggleSwitch.classList.contains('disabled')) {
+                if (toggleSwitch.dataset.inverted !== 'true') {
+                    toggleSwitch.style.background = '#e0e0e0';
+                }
+            }
+        });
+    });
+}
+
+// ✅ FUNZIONI DI SUPPORTO SEMPLIFICATE
+
+function resetAllFiltersAndSwitches() {
+    const toggleOptions = document.querySelectorAll('.toggle-option');
+    const toggleSwitches = document.querySelectorAll('.toggle-switch');
+
+    // Reset filtri
+    toggleOptions.forEach(opt => {
+        opt.classList.remove('active');
+        opt.style.background = 'transparent';
+        opt.style.color = '#666';
+        opt.style.boxShadow = 'none';
+
+        const square = opt.querySelector('div');
+        const colorMap = {
+            'all': 'rgb(7, 115, 152)',
+            'linked': '#ffcc00',
+            'scrub-bag': '#ff9800',
+            'redirected': '#9C27B0',
+            'high-value': '#228B22',
+            'otp': '#DC143C',
+            'mnr': '#FF5722',
+            'route-manual': '#8B4513'
+        };
+
+        square.style.backgroundColor = colorMap[opt.dataset.filter] || '#666';
+        square.style.opacity = '0.4';
+
+        // ✅ RIPRISTINA TESTO ORIGINALE DEI FILTRI
+        const filterText = opt.querySelector('.filter-text');
+        if (filterText && opt.dataset.filter !== 'all') {
+            const filterConfig = getStaticFilterConfig(opt.dataset.filter);
+            filterText.textContent = `${filterConfig.label}: ${filterConfig.count}`;
+        }
+    });
+
+    // ✅ DISABILITA TUTTI I TOGGLE SWITCHES
+    toggleSwitches.forEach(toggleSwitch => {
+        disableToggleSwitch(toggleSwitch);
+    });
+
+    debugLog('[RESET] All filters and switches reset');
+}
+
+
+function activateFilter(option, filterType) {
+    option.classList.add('active');
+    const square = option.querySelector('div');
+
+    const styleMap = {
+        'all': { bg: 'rgb(7, 115, 152)', shadow: 'rgba(7, 115, 152, 0.3)' },
+        'linked': { bg: 'linear-gradient(135deg, #ffcc00, #ffd54f)', shadow: 'rgba(255, 204, 0, 0.3)' },
+        'scrub-bag': { bg: 'linear-gradient(135deg, #ff9800, #ffb74d)', shadow: 'rgba(255, 152, 0, 0.3)' },
+        'redirected': { bg: 'linear-gradient(135deg, #9C27B0, #BA68C8)', shadow: 'rgba(156, 39, 176, 0.3)' },
+        'high-value': { bg: 'linear-gradient(135deg, #228B22, #32CD32)', shadow: 'rgba(34, 139, 34, 0.3)' },
+        'otp': { bg: 'linear-gradient(135deg, #DC143C, #FF6347)', shadow: 'rgba(220, 20, 60, 0.3)' },
+        'mnr': { bg: 'linear-gradient(135deg, #FF5722, #FF7043)', shadow: 'rgba(255, 87, 34, 0.3)' },
+        'route-manual': { bg: 'linear-gradient(135deg, #8B4513, #A0522D)', shadow: 'rgba(139, 69, 19, 0.3)' }
+    };
+
+    const style = styleMap[filterType];
+    if (style) {
+        option.style.background = style.bg;
+        option.style.color = 'white';
+        option.style.boxShadow = `0 2px 8px ${style.shadow}`;
+        square.style.backgroundColor = 'rgba(255, 255, 255, 0.9)';
+        square.style.opacity = '1';
+    }
+}
+
+function enableToggleSwitchForFilter(filterType) {
+    const toggleSwitch = document.querySelector(`[data-target="${filterType}"]`);
+
+    if (toggleSwitch && filterType !== 'all') { // Non abilitare per "Total"
+        // ✅ ABILITA IL TOGGLE
+        toggleSwitch.classList.remove('disabled');
+        toggleSwitch.dataset.inverted = 'false';
+        toggleSwitch.style.background = '#e0e0e0';
+        toggleSwitch.style.color = '#666';
+        toggleSwitch.style.cursor = 'pointer';
+        toggleSwitch.style.opacity = '1';
+        toggleSwitch.innerHTML = '🔄';
+
+        const filterConfig = getStaticFilterConfig(filterType);
+        toggleSwitch.title = `Toggle to show NOT ${filterConfig.label}`;
+
+        debugLog(`[TOGGLE] Enabled for ${filterType}`);
+    }
+}
+
+function disableToggleSwitch(toggleSwitch) {
+    toggleSwitch.classList.add('disabled');
+    toggleSwitch.dataset.inverted = 'false';
+    toggleSwitch.style.background = '#f5f5f5';
+    toggleSwitch.style.color = '#ccc';
+    toggleSwitch.style.cursor = 'not-allowed';
+    toggleSwitch.style.opacity = '0.5';
+    toggleSwitch.innerHTML = '🔄';
+    toggleSwitch.title = 'Select a filter first to enable toggle';
+}
+
+function updateToggleSwitch(toggleSwitch, filterType, isInverted) {
+    const filterConfig = getStaticFilterConfig(filterType);
+    const totalRows = getTotalUniqueRows();
+    const targetOption = document.querySelector(`[data-filter="${filterType}"]`);
+    const filterTextElement = targetOption.querySelector('.filter-text');
+
+    toggleSwitch.dataset.inverted = isInverted.toString();
+
+    if (isInverted) {
+        // Modalità NOT
+        const invertedCount = totalRows - filterConfig.count;
+
+        // ✅ AGGIORNA IL TESTO DEL FILTRO
+        filterTextElement.textContent = `NOT ${filterConfig.label}: ${invertedCount}`;
+
+        // ✅ AGGIORNA IL TOGGLE SWITCH
+        toggleSwitch.style.background = '#ff6b35';
+        toggleSwitch.style.color = 'white';
+        toggleSwitch.innerHTML = '↩️';
+        toggleSwitch.title = `Currently showing NOT ${filterConfig.label} (${invertedCount} items). Click to show ${filterConfig.label}`;
+
+        debugLog(`[TOGGLE] ${filterType} set to NOT mode (${invertedCount} items)`);
+    } else {
+        // Modalità normale
+
+        // ✅ RIPRISTINA IL TESTO ORIGINALE DEL FILTRO
+        filterTextElement.textContent = `${filterConfig.label}: ${filterConfig.count}`;
+
+        // ✅ RIPRISTINA IL TOGGLE SWITCH
+        toggleSwitch.style.background = '#e0e0e0';
+        toggleSwitch.style.color = '#666';
+        toggleSwitch.innerHTML = '🔄';
+        toggleSwitch.title = `Currently showing ${filterConfig.label} (${filterConfig.count} items). Click to show NOT ${filterConfig.label}`;
+
+        debugLog(`[TOGGLE] ${filterType} set to normal mode (${filterConfig.count} items)`);
+    }
+}
+
+
+function getStaticFilterConfig(filterType) {
+    // ✅ DATI STATICI - non dipendono dal DOM che può cambiare
+    const rows = document.querySelectorAll('#resultsTable tbody tr');
+    const datasetMapping = {
+        'linked': 'hasLinked',
+        'scrub-bag': 'hasScrubBag',
+        'redirected': 'hasRedirected',
+        'high-value': 'hasHighValue',
+        'otp': 'hasOtp',
+        'mnr': 'hasMnr',
+        'route-manual': 'hasRouteManual'
+    };
+
+    const labelMapping = {
+        'linked': 'TrId Linked',
+        'scrub-bag': 'Scrub Bag',
+        'redirected': 'Redirected',
+        'high-value': 'High Value',
+        'otp': 'OTP',
+        'mnr': 'MNR',
+        'route-manual': 'Route Manual Assignment'
+    };
+
+    const datasetKey = datasetMapping[filterType];
+    let count = 0;
+
+    if (datasetKey) {
+        rows.forEach(row => {
+            if (row.dataset[datasetKey] === 'true') {
+                count++;
+            }
+        });
+    }
+
+    return {
+        label: labelMapping[filterType] || 'Unknown',
+        count: count
+    };
+}
+
+function applyFilter(filterType, isInverted = false) {
+    const rows = document.querySelectorAll('#resultsTable tbody tr');
+    let visibleCount = 0;
+
+    rows.forEach(row => {
+        let showRow = false;
+
+        if (filterType === 'all') {
+            showRow = true;
+        } else {
+            const datasetMapping = {
+                'linked': 'hasLinked',
+                'scrub-bag': 'hasScrubBag',
+                'redirected': 'hasRedirected',
+                'high-value': 'hasHighValue',
+                'otp': 'hasOtp',
+                'mnr': 'hasMnr',
+                'route-manual': 'hasRouteManual'
+            };
+
+            const datasetKey = datasetMapping[filterType];
+            const hasIndicator = datasetKey && row.dataset[datasetKey] === 'true';
+
+            // ✅ LOGICA INVERTITA
+            showRow = isInverted ? !hasIndicator : hasIndicator;
+        }
+
+        row.style.display = showRow ? '' : 'none';
+        if (showRow) visibleCount++;
+    });
+
+    debugLog(`[FILTER] ${filterType} (inverted: ${isInverted}) - ${visibleCount} rows visible`);
+}
+
+function getTotalUniqueRows() {
+    const rows = document.querySelectorAll('#resultsTable tbody tr');
+    const uniqueTrackings = new Set();
+
+    rows.forEach(row => {
+        const trackingLink = row.querySelector('td:nth-child(2) a, td:nth-child(2) span');
+        if (trackingLink) {
+            uniqueTrackings.add(trackingLink.textContent.trim());
+        }
+    });
+
+    return uniqueTrackings.size;
+}
+
+console.log('[SCC] FINE SEZIONE 11: Main processing function');
+
+// ================================================================================================
+// SEZIONE 12: ACTION BUTTON HANDLERS
+// ================================================================================================
+
+console.log('[SCC] INIZIO SEZIONE 12: Action button handlers');
+
+function setupActionButtonHandlers(container) {
+    const searchButton = container.querySelector('#searchButton');
+    const trackingInput = container.querySelector('#trackingInput');
+    const table = container.querySelector('#resultsTable');
+    const tbody = table.querySelector('tbody');
+    const exportButton = container.querySelector('#exportButton');
+    const clearButton = container.querySelector('#clearButton');
+    const refreshButton = container.querySelector('#refreshButton');
+    const stateSelector = container.querySelector('#stateSelector');
+
+    if (!searchButton || !trackingInput || !table || !tbody || !exportButton || !clearButton) {
+        debugLog('Some UI elements not found for action buttons');
+        return false;
+    }
+
+    // Get update functions
+    function updateTrackingCount() {
+        const input = trackingInput.value;
+        const trackingIds = extractTrackingNumbers(input);
+        const uniqueMatches = [...new Set(trackingIds)];
+        const count = uniqueMatches.length;
+
+        const trackingCountDiv = container.querySelector('#trackingCount');
+        if (trackingCountDiv) {
+            trackingCountDiv.textContent = `${count} unique tracking number${count !== 1 ? 's' : ''}`;
+        }
+    }
+
+    function updateSelectedCount() {
+        const count = Array.from(stateSelector.selectedOptions).length;
+        const selectedCountDiv = container.querySelector('#stateSelectedCount');
+        if (selectedCountDiv) {
+            selectedCountDiv.textContent = `${count} state${count !== 1 ? 's' : ''} selected`;
+        }
+    }
+
+    function updateSearchButtonState() {
+        const selectedStates = Array.from(stateSelector.selectedOptions);
+        const hasValidState = selectedStates.length > 0;
+
+        const trackingIds = extractTrackingNumbers(trackingInput.value);
+        const uniqueMatches = [...new Set(trackingIds)];
+        const hasTrackings = uniqueMatches.length > 0;
+
+        const isEnabled = hasValidState && hasTrackings;
+
+        searchButton.disabled = !isEnabled;
+        searchButton.style.opacity = isEnabled ? '1' : '0.5';
+        searchButton.style.cursor = isEnabled ? 'pointer' : 'not-allowed';
+    }
+
+    // Setup search button click event
+    searchButton.addEventListener('click', async () => {
+        debugLog('Search button clicked');
+
+        try {
+            const trackings = trackingInput.value.split('\n').filter(t => t.trim());
+
+            if (trackings.length === 0) {
+                alert('Please enter at least one tracking number');
+                return;
+            }
+
+            debugLog(`Processing ${trackings.length} trackings`);
+
+            // 🚀 ATTIVA STATO SEARCHING (con progresso 0)
+            setToggleButtonState('searching', 0);
+            searchButton.disabled = true;
+
+            await window.processTrackings(trackings);
+
+            debugLog('Processing completed');
+
+            // 🎉 ATTIVA STATO COMPLETED quando appare export button
+            setTimeout(() => {
+                const exportButton = document.getElementById('exportButton');
+                if (exportButton && exportButton.style.display !== 'none') {
+                    setToggleButtonState('completed');
+                }
+            }, 500);
+
+        } catch (error) {
+            debugLog('Error in search processing:', error);
+            console.error('Full error:', error);
+            setToggleButtonState('idle');
+            alert('An error occurred during search processing: ' + error.message);
+        } finally {
+            searchButton.disabled = false;
+        }
+    });
+
+    // Setup clear button click event
+    clearButton.addEventListener('click', () => {
+        debugLog('Clear button clicked - Full reset with API abort');
+
+        // 🔄 RESET TOGGLE BUTTON STATE
+        setToggleButtonState('idle');
+
+        // 🆕 RESET UPDATE NOTIFICATION se presente
+        const updateNotification = document.getElementById('scc-update-notification');
+        if (updateNotification) {
+            updateNotification.remove();
+            debugLog('Update notification dismissed during clear');
+        }
+
+        // 🛑 INTERROMPI LE CHIAMATE API IN CORSO
+        if (window.abortController) {
+            window.abortController.abort();
+            window.abortController = null;
+            debugLog('Ongoing API calls cancelled');
+        }
+
+        // Reset tutto...
+        trackingInput.value = '';
+        tbody.innerHTML = '';
+        table.style.display = 'none';
+        exportButton.style.display = 'none';
+
+        const progressContainer = document.getElementById('progressContainer');
+        const progressBar = document.getElementById('progressBar');
+        const progressText = document.getElementById('progressText');
+
+        if (progressContainer) progressContainer.style.display = 'none';
+        if (progressBar) progressBar.style.width = '0%';
+        if (progressText) progressText.textContent = '0%';
+
+        const summaryDiv = document.getElementById('indicatorSummary');
+        if (summaryDiv) {
+            summaryDiv.style.display = 'none';
+            const filterButtonsDiv = document.getElementById('filterButtons');
+            if (filterButtonsDiv) filterButtonsDiv.innerHTML = '';
+        }
+
+        // ✅ RESET FILTRI COLONNA
+        const filterInputs = document.querySelectorAll('.column-filter');
+        filterInputs.forEach(input => input.value = '');
+
+        const columnFilterSummary = document.getElementById('column-filter-summary');
+        if (columnFilterSummary) columnFilterSummary.style.display = 'none';
+
+        Array.from(stateSelector.options).forEach(option => option.selected = false);
+
+        const enableDateFilter = container.querySelector('#enableDateFilter');
+        const dateFilterContainer = container.querySelector('#dateFilterContainer');
+
+        if (enableDateFilter) enableDateFilter.checked = false;
+        if (dateFilterContainer) dateFilterContainer.style.display = 'none';
+
+        ['fromDate', 'toDate', 'fromTime', 'toTime'].forEach(id => {
+            const input = document.getElementById(id);
+            if (input) input.value = '';
+        });
+
+        updateTrackingCount();
+        updateSelectedCount();
+        updateSearchButtonState();
+
+        debugLog('Full reset completed with column filters');
+    });
+
+    // Export button
+    exportButton.addEventListener('click', () => {
+    debugLog('Export button clicked');
+    // ✅ ESPORTA SOLO RIGHE VISIBILI (dopo filtri colonna)
+    const visibleRows = tbody.querySelectorAll('tr:not([style*="display: none"])');
+
+    // ✅ SCHEMA FISSO - SEMPRE TUTTI I 7 INDICATORI
+    const sortedIndicators = [
+        'linked-package',
+        'scrub-bag',
+        'redirected',
+        'high-value',
+        'otp',
+        'mnr',
+        'route-manual'
+    ];
+
+    // ✅ HEADER CSV FISSO - AGGIORNATO CON DAYS OOR
+    const baseColumns = [
+        'Tracking ID', 'State Time', 'State', 'Source',
+        'Event Processed By', 'Sort Zone', 'Operation', 'Cycle', 'Reason', 'Days OOR'
+    ];
+
+    // ✅ NOMI FISSI E CONSISTENTI
+    const indicatorColumns = [
+        'TrId Linked',
+        'Scrub Bag',
+        'Redirected',
+        'High Value',
+        'OTP',
+        'MNR',
+        'Route Manual'
+    ];
+
+    const allColumns = [...baseColumns, ...indicatorColumns];
+    let csv = allColumns.join(',') + '\n';
+
+    debugLog(`Export columns (FIXED SCHEMA): ${allColumns.join(', ')}`);
+
+    // ✅ DATI CON INDICATORI (solo righe visibili)
+    visibleRows.forEach(row => {
+        const cells = Array.from(row.querySelectorAll('td')).slice(1); // Salta colonna indicatori visuale
+
+        // Dati base (tutte le colonne inclusa Days OOR) - CON PULIZIA AVANZATA
+        const baseData = cells.map((cell, index) => {
+            let text = cell.textContent.trim();
+
+            // ✅ PULIZIA SPECIALE PER TRACKING ID (prima colonna dopo indicatori)
+            if (index === 0) { // Colonna Tracking ID
+                text = text.replace(/\s+/g, '').replace(/[^\w]/g, '').toUpperCase();
+                debugLog(`[EXPORT CLEAN] Tracking ID cleaned: "${cell.textContent.trim()}" -> "${text}"`);
+            }
+
+            // ✅ PULIZIA GENERALE per tutte le altre colonne
+            text = text.replace(/\s+/g, ' ').trim(); // Normalizza spazi multipli in singoli
+
+            // ✅ ESCAPE CSV se necessario
+            if (text.includes(',') || text.includes('"') || text.includes('\n')) {
+                text = `"${text.replace(/"/g, '""')}"`;
+            }
+
+            return text;
+        });
+
+        // ✅ DATI INDICATORI CON SCHEMA FISSO
+        const rowIndicators = [];
+        try {
+            const indicators = JSON.parse(row.dataset.indicators || '[]');
+            // ✅ Per ogni indicatore FISSO, aggiungi YES/NO
+            sortedIndicators.forEach(type => {
+                rowIndicators.push(indicators.includes(type) ? 'YES' : 'NO');
+            });
+        } catch(e) {
+            // Se errore, riempi tutti con NO
+            sortedIndicators.forEach(() => rowIndicators.push('NO'));
+        }
+
+        const fullRowData = [...baseData, ...rowIndicators];
+        csv += fullRowData.join(',') + '\n';
+    });
+
+    // ✅ DOWNLOAD CON NOME SEMPLICE
+    const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    const now = new Date();
+    const formattedDate = now.toISOString().replace('T', '-').replace(/:/g, '').replace(/\..+/, '');
+    link.download = `SCC_ONE_STATUS_SEARCH_${formattedDate}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+
+    debugLog(`CSV exported with ${allColumns.length} columns and ${visibleRows.length} visible rows`);
+});
+
+    return true;
+}
+
+console.log('[SCC] FINE SEZIONE 12: Action button handlers');
+
+
+
+// ================================================================================================
+// SEZIONE 13: INITIALIZATION E SETUP
+// ================================================================================================
+
+console.log('[SCC] INIZIO SEZIONE 13: Initialization e setup');
+
+// ✅ FUNZIONE PRINCIPALE PER APRIRE L'INTERFACCIA (per uso interno)
+function openSearchInterface() {
+    const container = document.getElementById('sccSearchContainer');
+    if (container) {
+        container.style.display = container.style.display === 'none' ? 'block' : 'none';
+        // Nascondi export button quando si riapre
+        const exportButton = document.getElementById('exportButton');
+        if (exportButton) exportButton.style.display = 'none';
+    }
+}
+
+function initializeUI() {
+    const toggleButton = createToggleButton();
+    const container = createUI();
+
+    // Remove existing elements if they exist
+    const existingButton = document.getElementById('sccSearchToggle');
+    const existingContainer = document.getElementById('sccSearchContainer');
+    if (existingButton) existingButton.remove();
+    if (existingContainer) existingContainer.remove();
+
+    // ✅ CONTROLLO MASTER TOOLBAR - Controlla se il master toolbar è attivo
+    if (!window.toolbarRegistry.masterActive) {
+        debugLog('Master toolbar not active - creating standalone button');
+
+        // Find the target div and insert the button SOLO se master non è attivo
+        const targetDiv = document.querySelector('div[mrdn-masthead-actions]');
+        if (targetDiv) {
+            targetDiv.insertBefore(toggleButton, targetDiv.firstChild);
+        } else {
+            document.body.appendChild(toggleButton);
+        }
+
+        // Setup toggle button click event SOLO se master non è attivo
+        toggleButton.addEventListener('click', () => {
+            openSearchInterface();
+        });
+
+        debugLog('Standalone SCC button created and configured');
+    } else {
+        debugLog('Master toolbar active - button will be managed by master');
+
+        // Se master è attivo, aggiorna il riferimento del bottone per cleanup futuro
+        window.toolbarRegistry.scripts.get('scc-customizing-search').buttonElement = toggleButton;
+    }
+
+    // ✅ Il container va sempre creato (anche se master è attivo)
+    document.body.appendChild(container);
+
+    // Setup UI event listeners (sempre necessari)
+    setupUIEventListeners(container);
+
+    // Setup drag functionality (sempre necessario)
+    const titleBar = container.querySelector('#sccDragHandle');
+    setupDragFunctionality(container, titleBar);
+
+    return { container, toggleButton };
+}
+
+function setupEventListeners() {
+    debugLog('Setting up event listeners');
+
+    const container = document.getElementById('sccSearchContainer');
+    if (!container) {
+        debugLog('Container not found, retrying...');
+        return false;
+    }
+
+    const success = setupActionButtonHandlers(container);
+    if (success) {
+        debugLog('Event listeners setup completed successfully');
+    }
+
+    return success;
+}
+
+function initializeScript() {
+    if (scriptState.initialized) {
+        debugLog('Script already initialized');
+        return;
+    }
+
+    debugLog('Creating UI elements');
+    initializeUI();
+    addCustomStyles();
+
+    // Try to setup event listeners with retries
+    let attempts = 0;
+    const maxAttempts = scriptState.maxAttempts;
+
+    function trySetup() {
+        if (attempts >= maxAttempts) {
+            debugLog('Max setup attempts reached');
+            return;
+        }
+
+        if (!setupEventListeners()) {
+            attempts++;
+            debugLog(`Setup attempt ${attempts} failed, retrying in 100ms...`);
+            setTimeout(trySetup, 100);
+        } else {
+            debugLog('Setup completed successfully');
+            scriptState.initialized = true;
+        }
+    }
+
+    trySetup();
+}
+
+console.log('[SCC] FINE SEZIONE 13: Initialization e setup');
+
+// ================================================================================================
+// SEZIONE 14: MAIN EXECUTION
+// ================================================================================================
+
+console.log('[SCC] INIZIO SEZIONE 14: Main execution');
+
+// Variabile globale per evitare chiamate multiple di update check
+let updateCheckInitialized = false;
+
+// Initialize script
+if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    debugLog('Document ready, initializing immediately');
+    initializeScript();
+    checkIfUpdated(); // ✅ RILEVAMENTO AGGIORNAMENTO
+
+    // ✅ CHIAMATA UNICA AUTO-UPDATE CHECK
+    if (!updateCheckInitialized) {
+        initAutoUpdateCheck();
+        updateCheckInitialized = true;
+        debugLog('🚀 Auto-update check initialized');
+    }
+}
+
+// Add event listener for DOMContentLoaded
+document.addEventListener('DOMContentLoaded', () => {
+    debugLog('DOMContentLoaded event fired');
+    initializeScript();
+    checkIfUpdated(); // ✅ RILEVAMENTO AGGIORNAMENTO
+
+    // ✅ CHIAMATA UNICA AUTO-UPDATE CHECK (se non già fatto)
+    if (!updateCheckInitialized) {
+        initAutoUpdateCheck();
+        updateCheckInitialized = true;
+        debugLog('🚀 Auto-update check initialized via DOMContentLoaded');
+    }
+});
+
+// Final fallback with setTimeout
+setTimeout(() => {
+    debugLog('Timeout initialization');
+    initializeScript();
+    checkIfUpdated(); // ✅ RILEVAMENTO AGGIORNAMENTO
+
+    // ✅ CHIAMATA UNICA AUTO-UPDATE CHECK (se non già fatto)
+    if (!updateCheckInitialized) {
+        initAutoUpdateCheck();
+        updateCheckInitialized = true;
+        debugLog('🚀 Auto-update check initialized via timeout fallback');
+    }
+}, 2000);
+
+// Add a mutation observer to handle dynamic page loads
+const observer = new MutationObserver((mutations, obs) => {
+    if (document.getElementById('sccSearchToggle')) {
+        return;
+    }
+
+    debugLog('DOM mutation detected, reinitializing');
+    initializeScript();
+    // Non rifare l'update check qui per evitare spam - già gestito sopra
+});
+
+observer.observe(document.body, {
+    childList: true,
+    subtree: true
+});
+
+// 🧪 FUNZIONE DI TEST PER FORZARE UPDATE CHECK (rimuovi dopo il test)
+function forceUpdateCheck() {
+    debugLog('🧪 FORCING UPDATE CHECK FOR TESTING');
+    localStorage.removeItem('scc_last_update_check'); // Reset timestamp
+    checkForUpdates().then(result => {
+        debugLog(`🧪 Force update check result: ${result}`);
+    });
+}
+
+// 🧪 ATTIVA TEST DOPO 5 SECONDI (rimuovi dopo il test)
+setTimeout(() => {
+    debugLog('🧪 Starting forced update check test...');
+    forceUpdateCheck();
+}, 5000);
+
+console.log('[SCC] FINE SEZIONE 14: Main execution');
+console.log('[SCC] Script initialization completed');
+
+})();
